@@ -1,0 +1,19 @@
+project: distillNas
+model: yolo26x.pt
+baseline_model: YOLOv26x
+dataset:
+  name: VisDrone
+  kaggle_slug: banuprasadb/visdrone-dataset
+  data_root: /kaggle/input/visdrone-dataset
+  split: val
+evaluation:
+  imgsz: 640
+  batch: 16
+  device: "0,1"
+  accelerator: NvidiaTeslaT4
+checkpoint:
+  save: false
+  store: none
+logging:
+  wandb: true
+  project: distillNas
