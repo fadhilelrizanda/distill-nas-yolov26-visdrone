@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import yaml
@@ -31,6 +31,7 @@ class VisDroneSplit:
     root: Path
     images: Path
     annotations: Path
+    yolo_labels: bool = field(default=False)  # True when labels/ is already YOLO format
 
 
 @dataclass(frozen=True)
@@ -46,18 +47,33 @@ class PreparedDataset:
 
 
 def find_visdrone_splits(data_root: Path) -> dict[str, VisDroneSplit]:
-    """Find VisDrone DET split directories under a Kaggle dataset mount."""
+    """Find VisDrone DET split directories under a Kaggle dataset mount.
+
+    Supports both the original VisDrone layout (annotations/) and
+    pre-converted Kaggle datasets that store YOLO labels in labels/.
+    """
     data_root = data_root.expanduser().resolve()
     if not data_root.exists():
         raise FileNotFoundError(f"data root does not exist: {data_root}")
 
     candidates: list[VisDroneSplit] = []
+
+    # Prefer original VisDrone format: split_root/annotations/ + split_root/images/
     for annotation_dir in data_root.rglob("annotations"):
         split_root = annotation_dir.parent
         images_dir = split_root / "images"
         if images_dir.is_dir() and annotation_dir.is_dir():
             name = _infer_split_name(split_root)
-            candidates.append(VisDroneSplit(name=name, root=split_root, images=images_dir, annotations=annotation_dir))
+            candidates.append(VisDroneSplit(name=name, root=split_root, images=images_dir, annotations=annotation_dir, yolo_labels=False))
+
+    # Fall back to pre-converted YOLO format: split_root/labels/ + split_root/images/
+    if not candidates:
+        for labels_dir in data_root.rglob("labels"):
+            split_root = labels_dir.parent
+            images_dir = split_root / "images"
+            if images_dir.is_dir() and labels_dir.is_dir():
+                name = _infer_split_name(split_root)
+                candidates.append(VisDroneSplit(name=name, root=split_root, images=images_dir, annotations=labels_dir, yolo_labels=True))
 
     if not candidates:
         raise FileNotFoundError(f"could not find VisDrone images/annotations split under {data_root}")
@@ -78,22 +94,31 @@ def prepare_yolo_dataset(data_root: Path, output_root: Path, split: str = "val")
     source = splits[split]
     output_root = output_root.expanduser().resolve()
     image_link = output_root / "images" / split
-    label_dir = output_root / "labels" / split
-    label_dir.mkdir(parents=True, exist_ok=True)
     image_link.parent.mkdir(parents=True, exist_ok=True)
-
     _ensure_image_link(source.images, image_link)
 
     image_paths = sorted(path for path in source.images.iterdir() if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"})
-    label_count = 0
-    skipped_count = 0
-    for image_path in image_paths:
-        annotation_path = source.annotations / f"{image_path.stem}.txt"
-        output_label = label_dir / f"{image_path.stem}.txt"
-        labels, skipped = convert_annotation_file(annotation_path, image_path)
-        skipped_count += skipped
-        label_count += len(labels)
-        output_label.write_text("".join(labels), encoding="utf-8")
+
+    if source.yolo_labels:
+        # Labels are already in YOLO format — symlink the directory directly.
+        label_dir = output_root / "labels" / split
+        label_dir.parent.mkdir(parents=True, exist_ok=True)
+        _ensure_image_link(source.annotations, label_dir)
+        label_count = sum(1 for p in source.annotations.iterdir() if p.suffix == ".txt")
+        skipped_count = 0
+    else:
+        # Convert from original VisDrone CSV annotation format.
+        label_dir = output_root / "labels" / split
+        label_dir.mkdir(parents=True, exist_ok=True)
+        label_count = 0
+        skipped_count = 0
+        for image_path in image_paths:
+            annotation_path = source.annotations / f"{image_path.stem}.txt"
+            output_label = label_dir / f"{image_path.stem}.txt"
+            labels, skipped = convert_annotation_file(annotation_path, image_path)
+            skipped_count += skipped
+            label_count += len(labels)
+            output_label.write_text("".join(labels), encoding="utf-8")
 
     yaml_path = output_root / "visdrone.yaml"
     yaml_payload = {
