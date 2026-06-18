@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+kaggle.json
+wandb_api_key*
+
+# Outputs
+outputs/
+artifacts/
+checkpoints/
+weights/
+runs/
+wandb/

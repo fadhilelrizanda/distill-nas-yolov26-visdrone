@@ -1,0 +1,7 @@
+project: distillNas
+dataset:
+  name: visdrone
+  kaggle_slug: banuprasadb/visdrone-dataset
+  data_root: /kaggle/input/visdrone-dataset
+checkpoint:
+  store: wandb_artifact
