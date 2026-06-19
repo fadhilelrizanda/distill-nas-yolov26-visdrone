@@ -2,17 +2,91 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import platform
 import subprocess
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .visdrone import prepare_yolo_dataset, VISDRONE_NAMES
+
+
+def _make_epoch_callbacks(
+    run_id: str,
+    project: str,
+    entity: str | None,
+    checkpoint_interval: int = 5,
+) -> tuple[Any, Any]:
+    """Return (on_fit_epoch_end, on_model_save) callbacks for DDP-aware per-epoch W&B logging.
+
+    Inside DDP subprocesses wandb.run is None, so each callback re-attaches to the
+    parent-process run via resume="must" before logging.
+    """
+    import wandb
+
+    def _ensure_run() -> None:
+        if not wandb.run:
+            wandb.init(project=project, entity=entity, id=run_id, resume="must")
+
+    def on_fit_epoch_end(trainer: Any) -> None:
+        if getattr(trainer, "rank", 0) != 0:
+            return
+        _ensure_run()
+        epoch = trainer.epoch + 1
+        log: dict[str, Any] = {"epoch": epoch, **trainer.metrics}
+        if hasattr(trainer, "optimizer") and trainer.optimizer:
+            for i, pg in enumerate(trainer.optimizer.param_groups):
+                log[f"lr/pg{i}"] = pg["lr"]
+        wandb.log(log, step=epoch)
+
+    def on_model_save(trainer: Any) -> None:
+        if getattr(trainer, "rank", 0) != 0:
+            return
+        epoch = trainer.epoch + 1
+        if epoch % checkpoint_interval != 0:
+            return
+        _ensure_run()
+        last_pt = Path(trainer.last)
+        if not last_pt.exists():
+            return
+        art = wandb.Artifact(
+            name=f"checkpoint-epoch{epoch:04d}",
+            type="model",
+            metadata={"epoch": epoch, **trainer.metrics},
+        )
+        art.add_file(str(last_pt), name="last.pt")
+        wandb.log_artifact(art)
+
+    return on_fit_epoch_end, on_model_save
+
+
+def _replay_csv_to_wandb(csv_path: Path) -> None:
+    """Replay Ultralytics results.csv to W&B as fallback if callbacks missed epochs."""
+    import wandb
+
+    if not csv_path.exists() or not wandb.run:
+        return
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Ultralytics pads column names with spaces — strip all keys and values.
+            stripped = {k.strip(): v.strip() for k, v in row.items()}
+            try:
+                epoch = int(float(stripped.pop("epoch", 0)))
+            except ValueError:
+                continue
+            step_metrics: dict[str, Any] = {}
+            for k, v in stripped.items():
+                try:
+                    step_metrics[k] = float(v)
+                except ValueError:
+                    pass
+            if step_metrics:
+                wandb.log({"epoch": epoch, **step_metrics}, step=epoch)
 
 
 def run_yolov26x_finetune(
@@ -101,6 +175,12 @@ def run_yolov26x_finetune(
         config=config,
     )
 
+    cb_epoch, cb_checkpoint = _make_epoch_callbacks(
+        run_id=wandb_run.id,
+        project=wandb_project,
+        entity=wandb_entity,
+    )
+
     metrics: dict[str, Any] = {}
     try:
         # If resume is requested and a previous last.pt exists in results, use it.
@@ -109,6 +189,13 @@ def run_yolov26x_finetune(
             model = YOLO(str(last_pt_resume))
         else:
             model = YOLO(model_name)
+
+        # Replace Ultralytics' built-in W&B callbacks with our DDP-aware versions so
+        # there is exactly one W&B run and metrics are logged every epoch in real time.
+        for _event in ("on_pretrain_routine_start", "on_fit_epoch_end", "on_val_end", "on_model_save", "on_train_end"):
+            model.clear_callback(_event)
+        model.add_callback("on_fit_epoch_end", cb_epoch)
+        model.add_callback("on_model_save", cb_checkpoint)
 
         model.train(
             data=str(combined_yaml_path),
@@ -131,6 +218,9 @@ def run_yolov26x_finetune(
             plots=True,
             verbose=True,
         )
+
+        # Safety net: replay results.csv in case DDP subprocess callbacks missed epochs.
+        _replay_csv_to_wandb(results_dir / "yolov26x_visdrone_finetune" / "results.csv")
 
         best_pt = results_dir / "yolov26x_visdrone_finetune" / "weights" / "best.pt"
         last_pt = results_dir / "yolov26x_visdrone_finetune" / "weights" / "last.pt"
