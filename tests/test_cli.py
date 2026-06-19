@@ -51,11 +51,13 @@ def test_injection_template_produces_valid_python():
         content = Path(filepath).read_text()
 
         # Verify injection markers
-        assert "Custom W&B DDP callbacks" in content
+        assert "Custom DDP metrics logging" in content
         assert "on_fit_epoch_end" in content
         assert "on_model_save" in content
-        assert "_LIVE_BATCH_LOG = False" in content
-        assert "_CHECKPOINT_INTERVAL = 1" in content
+        # live_batch_log=False → template substitutes "if False:"
+        assert "if False:" in content
+        # checkpoint_interval=1 → substituted directly into condition
+        assert "epoch % 1 != 0" in content
 
         # Must be syntactically valid Python
         ast.parse(content)

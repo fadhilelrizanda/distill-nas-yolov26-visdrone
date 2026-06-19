@@ -8,12 +8,20 @@ from the parent::
     - custom callbacks registered via ``model.add_callback()`` are lost
     - ``model.clear_callback()`` affects only the parent's trainer instance
 
-The default Ultralytics ``wb.py`` callbacks fire inside the subprocess and start
-a **second unrelated** W&B run, creating noise in the project.
+The default Ultralytics ``wb.py`` callbacks fire inside the subprocess and start a
+**second unrelated** W&B run, creating noise in the project.
+
+**DDP cannot make W&B API calls** — calling ``wandb.init(resume="must", id=...)``
+from inside the DDP subprocess hangs for 90 s then times out with
+``CommError`` because you cannot resume a session from a different Unix process on
+Kaggle's network setup.
 
 **Solution** — monkey-patch ``ultralytics.utils.dist.generate_ddp_file`` so the
-temporary file that the DDP subprocess executes includes custom W&B callbacks
-that resume the parent process's run.
+temporary file that the DDP subprocess executes:
+
+1. Strips the default Ultralytics W&B callbacks (prevents duplicate runs)
+2. Writes per-epoch / per-checkpoint metrics to a **shared JSONL file** on disk
+3. The parent process polls this file in a background thread and forwards to W&B
 """
 
 from __future__ import annotations
@@ -23,107 +31,87 @@ import string
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# Template appended to the generated DDP temp file.
+# Template injected into the generated DDP temp file.
 # Uses string.Template ($var) so Python dict-literals with {} work naturally.
 # ---------------------------------------------------------------------------
 
 _INJECTION_TEMPLATE = string.Template(
     """
-# === Custom W&B DDP callbacks (injected by distill-nas/patches.py) ===
+# === Custom DDP metrics logging (injected by distill-nas/patches.py) ===
+import json
 import os
 from pathlib import Path
 from ultralytics.utils import RANK
 
-_WANDB_DDP_RUN_ID = os.environ.get("_WANDB_DDP_RUN_ID")
-_WANDB_DDP_PROJECT = os.environ.get("_WANDB_DDP_PROJECT", "")
-_WANDB_DDP_ENTITY = os.environ.get("_WANDB_DDP_ENTITY")
-_CHECKPOINT_INTERVAL = $checkpoint_interval
-_LIVE_BATCH_LOG = $live_batch_log
+_METRICS_PATH = os.environ.get("_WANDB_METRICS_FILE", "")
 
-if _WANDB_DDP_RUN_ID:
-    import wandb as _wb
+# Strip default Ultralytics W&B callbacks so they do not create a second run.
+for _event in ("on_pretrain_routine_start", "on_fit_epoch_end",
+               "on_train_epoch_end", "on_train_end"):
+    trainer.callbacks[_event] = [
+        _cb for _cb in trainer.callbacks.get(_event, [])
+        if not getattr(_cb, "__module__", "").endswith(".wb")
+    ]
 
-    # Strip default Ultralytics W&B callbacks from the subprocess trainer so
-    # they do not create a second unrelated run.  We filter by __module__
-    # because the callbacks are plain functions defined in wb.py.
-    for _event in ("on_pretrain_routine_start", "on_fit_epoch_end",
-                   "on_train_epoch_end", "on_train_end"):
-        trainer.callbacks[_event] = [
-            _cb for _cb in trainer.callbacks.get(_event, [])
-            if not getattr(_cb, "__module__", "").endswith(".wb")
-        ]
+def _write_event(event_dict):
+    if not _METRICS_PATH:
+        return
+    try:
+        with open(_METRICS_PATH, "a") as _f:
+            _f.write(json.dumps(event_dict) + "\\n")
+            _f.flush()
+    except Exception:
+        pass
 
-    def _ensure_run():
-        if _wb.run is None:
-            _wb.init(project=_WANDB_DDP_PROJECT,
-                     entity=_WANDB_DDP_ENTITY,
-                     id=_WANDB_DDP_RUN_ID,
-                     resume="must")
+# -- per-epoch logging ----------------------------------------------------
+def _epoch_log(trainer):
+    if RANK not in (-1, 0):
+        return
+    _write_event({
+        "event": "epoch_end",
+        "epoch": trainer.epoch + 1,
+        "metrics": trainer.metrics,
+        "lr": trainer.lr if hasattr(trainer, "lr") and trainer.lr else None,
+    })
 
-    # -- per-epoch logging ------------------------------------------------
-    def _epoch_log(trainer):
+# -- per-batch live logging (optional, noisy) -----------------------------
+if $live_batch_log:
+
+    def _batch_log(trainer):
         if RANK not in (-1, 0):
             return
-        _ensure_run()
-        epoch = trainer.epoch + 1
-        log = {"epoch": epoch, **trainer.metrics}
-        if hasattr(trainer, "lr") and trainer.lr:
-            log.update(trainer.lr)
-        _wb.log(log, step=epoch)
+        step = trainer.epoch * len(trainer.loader) + trainer.batch_i
+        _write_event({
+            "event": "batch_end",
+            "epoch": trainer.epoch + 1,
+            "batch": trainer.batch_i,
+            "step": step,
+            "tloss": trainer.tloss.tolist() if hasattr(trainer.tloss, "tolist") else None,
+        })
 
-    # -- per-batch live logging (optional, noisy) -------------------------
-    if _LIVE_BATCH_LOG:
+    trainer.add_callback("on_train_batch_end", _batch_log)
 
-        def _batch_log(trainer):
-            if RANK not in (-1, 0):
-                return
-            _ensure_run()
-            step = trainer.epoch * len(trainer.train_loader) + trainer.batch_i
-            loss_items = getattr(trainer, "tloss", None)
-            log = {"live/step": step, "live/epoch": trainer.epoch + 1}
-            if loss_items is not None:
-                if hasattr(loss_items, "tolist"):
-                    items = loss_items.tolist()
-                    if isinstance(items, (list, tuple)):
-                        for idx, val in enumerate(items):
-                            log["live/loss_" + str(idx)] = val
-                    else:
-                        log["live/loss"] = items
-            _wb.log(log, step=step)
+# -- checkpoint logging ---------------------------------------------------
+def _checkpoint_log(trainer):
+    if RANK not in (-1, 0):
+        return
+    epoch = trainer.epoch + 1
+    if $checkpoint_interval > 0 and epoch % $checkpoint_interval != 0:
+        return
+    _write_event({
+        "event": "checkpoint",
+        "epoch": epoch,
+        "path": str(trainer.last),
+        "metrics": trainer.metrics,
+    })
 
-        trainer.add_callback("on_train_batch_end", _batch_log)
+# -- finalise -------------------------------------------------------------
+def _train_end(trainer):
+    _write_event({"event": "train_end"})
 
-    # -- checkpoint artifact logging --------------------------------------
-    def _checkpoint_log(trainer):
-        if RANK not in (-1, 0):
-            return
-        epoch = trainer.epoch + 1
-        if _CHECKPOINT_INTERVAL > 0 and epoch % _CHECKPOINT_INTERVAL != 0:
-            return
-        _ensure_run()
-        last_pt = Path(trainer.last)
-        if last_pt.exists():
-            art = _wb.Artifact(
-                name="checkpoint-epoch%04d" % epoch,
-                type="model",
-                metadata={"epoch": epoch, **trainer.metrics},
-            )
-            art.add_file(str(last_pt), name="last.pt")
-            _wb.log_artifact(art)
-
-    # -- finalise ---------------------------------------------------------
-    def _train_end(trainer):
-        _ensure_run()
-        _wb.run.finish()
-
-    # Register callbacks (order matters: epoch_end runs AFTER model_save in
-    # the Ultralytics loop, so metrics are up-to-date).
-    trainer.add_callback("on_fit_epoch_end", _epoch_log)
-    trainer.add_callback("on_model_save", _checkpoint_log)
-    trainer.add_callback("on_train_end", _train_end)
-else:
-    import warnings
-    warnings.warn("_WANDB_DDP_RUN_ID not set -- no W&B DDP logging in subprocess")
+trainer.add_callback("on_fit_epoch_end", _epoch_log)
+trainer.add_callback("on_model_save", _checkpoint_log)
+trainer.add_callback("on_train_end", _train_end)
 """
 )
 
@@ -132,21 +120,21 @@ def patch_generate_ddp_file(
     checkpoint_interval: int = 1,
     live_batch_log: bool = False,
 ) -> None:
-    """Monkey-patch Ultralytics' DDP file generator to inject W&B callbacks.
+    """Monkey-patch Ultralytics' DDP file generator to inject metrics logging.
 
     The patched version writes the original generated temp file, then inserts
     *INJECTION_TEMPLATE* into it just before ``trainer.train()`` is called.
-    This ensures the custom W&B callbacks are registered *before* training begins.
+    This ensures the custom callbacks are registered *before* training begins.
 
     Parameters
     ----------
     checkpoint_interval:
-        Upload a W&B checkpoint artifact every N epochs (default 1 = every
-        epoch).  Set to 0 to disable checkpoint artifacts during training
-        (the final checkpoint is still uploaded by the parent process).
+        Write a checkpoint event to the metrics file every N epochs (default 1
+        = every epoch).  Set to 0 to disable.  The parent process uses these
+        events to upload W&B checkpoint artifacts.
     live_batch_log:
-        If True, log per-batch training losses (noisy — useful for
-        debugging convergence issues).
+        If True, write per-batch loss events to the metrics file (noisy — useful
+        for debugging convergence issues).
     """
     import ultralytics.utils.dist as dist_module  # noqa: TID252
 
@@ -180,11 +168,12 @@ def install_patches(
     checkpoint_interval: int = 1,
     live_batch_log: bool = False,
 ) -> None:
-    """Apply all patches needed for DDP-aware W&B logging.
+    """Apply all patches needed for DDP-aware metrics logging.
 
     Call this **after** ``wandb.init()`` and **before** ``model.train()``.
-    Also set ``os.environ["_WANDB_DDP_RUN_ID"]`` to the current run id so the
-    DDP subprocess knows which run to resume.
+    You must also set ``os.environ["_WANDB_METRICS_FILE"]`` to the path of the
+    JSONL file the DDP subprocess will write to (the parent process should
+    poll this file and forward events to W&B).
 
     Parameters
     ----------

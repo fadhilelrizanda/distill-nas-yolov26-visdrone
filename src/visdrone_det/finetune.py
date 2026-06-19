@@ -6,6 +6,9 @@ import json
 import os
 import platform
 import subprocess
+import threading
+import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +16,82 @@ import yaml
 
 from .patches import install_patches
 from .visdrone import prepare_yolo_dataset, VISDRONE_NAMES
+
+# ── background poller for DDP metrics ──────────────────────────────────────
+
+
+def _poll_metrics(
+    metrics_file: Path,
+    poll_interval: float,
+    stop_event: threading.Event,
+) -> Iterator[dict[str, Any]]:
+    """Yield events from the JSONL *metrics_file* as they arrive.
+
+    Runs in a background thread while ``model.train()`` blocks the parent
+    process.  Yields parsed dicts — the caller decides what to do with them.
+    """
+    last_pos = 0
+    # Wait for the file to exist (DDP subprocess may take a moment to start).
+    for _ in range(60):  # up to 60 s
+        if stop_event.is_set() or metrics_file.exists():
+            break
+        time.sleep(1)
+    while not stop_event.is_set():
+        try:
+            with open(metrics_file) as f:
+                f.seek(last_pos)
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        yield json.loads(line)
+                last_pos = f.tell()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        time.sleep(poll_interval)
+
+
+def _wandb_poller_thread(
+    metrics_file: Path,
+    wandb_run: Any,
+    stop_event: threading.Event,
+    checkpoint_interval: int,
+) -> None:
+    """Background thread: polls *metrics_file* and forwards events to W&B.
+
+    Handles three event types:
+        ``epoch_end``   → ``wandb.log`` with metrics + LR
+        ``checkpoint``  → ``wandb.log_artifact`` (last.pt)
+        ``train_end``   → no action (parent handles finalisation)
+    """
+    import wandb
+
+    for event in _poll_metrics(metrics_file, poll_interval=5.0, stop_event=stop_event):
+        evt = event.get("event")
+        if evt == "epoch_end":
+            epoch = event.get("epoch", 0)
+            log = {"epoch": epoch}
+            if event.get("metrics"):
+                log.update(event["metrics"])
+            if event.get("lr"):
+                log.update(event["lr"])
+            wandb.log(log, step=epoch)
+        elif evt == "checkpoint" and checkpoint_interval > 0:
+            ckpt_path = event.get("path")
+            epoch = event.get("epoch", 0)
+            if ckpt_path and Path(ckpt_path).exists():
+                art = wandb.Artifact(
+                    name=f"checkpoint-epoch{epoch:04d}",
+                    type="model",
+                    metadata={"epoch": epoch, **(event.get("metrics") or {})},
+                )
+                art.add_file(ckpt_path, name="last.pt")
+                wandb.log_artifact(art)
+        # train_end is a no-op; the parent's finally block handles finish()
+
+
+# ── main entrypoint ────────────────────────────────────────────────────────
 
 
 def run_yolov26x_finetune(
@@ -39,8 +118,9 @@ def run_yolov26x_finetune(
 ) -> dict[str, Any]:
     """Fine-tune YOLOv26x on VisDrone train split and evaluate on val, logging to W&B.
 
-    Per-epoch metrics and checkpoints are logged to W&B in real time via a
-    monkey-patch of Ultralytics' DDP subprocess (see :mod:`patches`).
+    Per-epoch metrics and checkpoints are logged to W&B in real time via
+    a background thread that reads from a shared JSONL file written by the
+    DDP subprocess (see :mod:`patches`).
 
     Parameters
     ----------
@@ -55,6 +135,7 @@ def run_yolov26x_finetune(
     dataset_dir = work_dir / "visdrone_yolo"
     results_dir = work_dir / "results"
     results_dir.mkdir(parents=True, exist_ok=True)
+    metrics_file = results_dir / "ddp_metrics.jsonl"
 
     # Prepare both splits; each call creates images/<split>/ and labels/<split>/ symlinks.
     train_prepared = prepare_yolo_dataset(data_root=data_root, output_root=dataset_dir, split="train")
@@ -117,17 +198,29 @@ def run_yolov26x_finetune(
     #
     # Ultralytics DDP spawns a subprocess (torch.distributed.run) that
     # re-imports the trainer from scratch and loses the parent's W&B run
-    # and custom callbacks.  We monkey-patch the DDP temp-file generator
-    # so the subprocess resurrects the parent run and registers its own
-    # per-epoch / checkpoint callbacks.
+    # and custom callbacks.  We cannot call wandb.init() from inside the
+    # DDP subprocess — it times out after 90 s (CommError).
+    #
+    # Instead, the monkey-patch writes per-epoch / per-checkpoint events
+    # to a shared JSONL file.  A background thread in the parent polls
+    # this file and forwards events to W&B over the already-established
+    # connection.
     #
     # Environment variables survive subprocess.run() and are the bridge.
     # ------------------------------------------------------------------
-    os.environ["_WANDB_DDP_RUN_ID"] = wandb_run.id
-    os.environ["_WANDB_DDP_PROJECT"] = wandb_project
-    if wandb_entity:
-        os.environ["_WANDB_DDP_ENTITY"] = wandb_entity
+    os.environ["_WANDB_METRICS_FILE"] = str(metrics_file)
     install_patches(checkpoint_interval=1, live_batch_log=live_batch_log)
+
+    # Clean slate for metrics file.
+    metrics_file.write_text("", encoding="utf-8")
+
+    stop_event = threading.Event()
+    poller_thread = threading.Thread(
+        target=_wandb_poller_thread,
+        args=(metrics_file, wandb_run, stop_event, 1),
+        daemon=True,
+    )
+    poller_thread.start()
 
     metrics: dict[str, Any] = {}
     try:
@@ -212,6 +305,8 @@ def run_yolov26x_finetune(
             wandb_run.log_artifact(artifact)
 
     finally:
+        stop_event.set()
+        poller_thread.join(timeout=30)
         wandb.finish()
 
     print(json.dumps(metrics, indent=2, sort_keys=True))
