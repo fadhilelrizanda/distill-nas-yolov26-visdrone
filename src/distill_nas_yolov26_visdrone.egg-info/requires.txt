@@ -1,0 +1,8 @@
+pyyaml>=6.0
+
+[dev]
+pytest>=8
+
+[kaggle]
+ultralytics>=8.3.0
+wandb>=0.17.0

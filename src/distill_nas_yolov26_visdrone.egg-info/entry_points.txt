@@ -1,0 +1,2 @@
+[console_scripts]
+visdrone-det = visdrone_det.cli:main

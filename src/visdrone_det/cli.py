@@ -57,6 +57,8 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--warmup-epochs", type=int, default=3)
     finetune.add_argument("--cache", action="store_true", default=False)
     finetune.add_argument("--resume", action="store_true", default=False)
+    finetune.add_argument("--live-batch-log", action="store_true", default=False,
+                         help="Log per-batch training losses to W&B (noisy, for debugging)")
     finetune.add_argument("--wandb-project", default="distillNas")
     finetune.add_argument("--wandb-entity", default=None)
     finetune.add_argument("--run-name", default=None)
@@ -118,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             run_name=args.run_name,
+            live_batch_log=args.live_batch_log,
         )
         return 0
     parser.error(f"unknown command: {args.command}")
