@@ -205,6 +205,9 @@ def _compose_frame(
         _draw_label(frame, names[cls_id], x1, y1, img_h, _GT_COLOR)
 
     # --- Prediction boxes (solid red) ---
+    # Use result.names (the model's own class map) — pretrained COCO has 80 classes,
+    # not 10, so VISDRONE_NAMES would index out of range for most COCO class IDs.
+    pred_names = result.names  # dict {class_id: class_name}
     pred_boxes: list[tuple[int, int, int, int, int, float]] = []
     if result.boxes is not None and len(result.boxes):
         for box in result.boxes:
@@ -213,7 +216,8 @@ def _compose_frame(
             conf = float(box.conf[0].item())
             pred_boxes.append((bx1, by1, bx2, by2, cls_id, conf))
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), _PRED_COLOR, thickness=2, lineType=cv2.LINE_AA)
-            _draw_label(frame, f"{names[cls_id]} {conf:.0%}", bx1, by1, img_h, _PRED_COLOR)
+            label = f"{pred_names.get(cls_id, str(cls_id))} {conf:.0%}"
+            _draw_label(frame, label, bx1, by1, img_h, _PRED_COLOR)
 
     _draw_legend(frame, conf_thresh)
 
