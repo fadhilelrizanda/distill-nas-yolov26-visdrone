@@ -222,6 +222,85 @@ class YOLOSupernet(nn.Module):
 
         self._init_weights()
 
+    def load_pretrained_backbone(
+        self,
+        weights: str,
+        verbose: bool = True,
+    ) -> dict[str, int]:
+        """Load matching weights from a pretrained YOLO model (e.g. YOLOv26s).
+
+        Maps each named supernet module to its corresponding YOLOv26s layer by
+        explicit index, then copies every parameter tensor whose shape matches.
+        ``SearchableC2f.cv2`` is always skipped — its input channel count
+        ``(2 + max_n) * hidden`` differs from the pretrained C2f which uses
+        ``(2 + actual_n) * hidden``.
+
+        Parameters
+        ----------
+        weights:
+            Local ``.pt`` path or Ultralytics model name (e.g. ``"yolo26s.pt"``).
+        verbose:
+            Print a one-line summary of loaded vs skipped tensors.
+
+        Returns
+        -------
+        dict with keys ``"loaded"`` and ``"skipped"``.
+        """
+        from ultralytics import YOLO  # imported lazily — not required at module load
+
+        pretrained_sd = YOLO(weights).model.state_dict()
+
+        # Explicit mapping: supernet attribute → YOLOv26s model.N prefix.
+        # Shape check below guards against wrong indices (e.g. if neck ordering
+        # differs across YOLO26 variants).
+        _MAP: list[tuple[str, str]] = [
+            # Backbone
+            ("stem",  "model.0"),
+            ("ds1",   "model.1"),
+            ("bb0",   "model.2"),
+            ("ds2",   "model.3"),
+            ("bb1",   "model.4"),
+            ("ds3",   "model.5"),
+            ("bb2",   "model.6"),
+            ("ds4",   "model.7"),
+            ("bb3",   "model.8"),
+            ("sppf",  "model.9"),
+            # Neck (indices assume standard YOLO26s FPN+PAN ordering)
+            ("neck0",  "model.12"),
+            ("neck1",  "model.15"),
+            ("dconv1", "model.16"),
+            ("neck2",  "model.18"),
+            ("dconv2", "model.19"),
+            ("neck3",  "model.21"),
+        ]
+
+        loaded = 0
+        skipped = 0
+        for attr, pre_prefix in _MAP:
+            module: nn.Module = getattr(self, attr)
+            local_sd = module.state_dict()
+            update: dict[str, torch.Tensor] = {}
+            for key, our_val in local_sd.items():
+                pre_key = f"{pre_prefix}.{key}"
+                pre_val = pretrained_sd.get(pre_key)
+                if pre_val is None or pre_val.shape != our_val.shape:
+                    skipped += 1
+                    continue
+                update[key] = pre_val
+                loaded += 1
+            if update:
+                local_sd.update(update)
+                module.load_state_dict(local_sd, strict=False)
+
+        if verbose:
+            total = loaded + skipped
+            print(
+                f"[supernet] pretrained init from {weights!r}: "
+                f"{loaded}/{total} tensors loaded, {skipped} skipped "
+                f"(cv2 shape mismatch expected)"
+            )
+        return {"loaded": loaded, "skipped": skipped}
+
     def _init_weights(self) -> None:
         prior_prob = 0.01
         cls_bias_init = math.log((1.0 - prior_prob) / prior_prob)

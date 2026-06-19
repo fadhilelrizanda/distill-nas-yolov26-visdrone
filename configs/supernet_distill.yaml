@@ -1,0 +1,37 @@
+# Supernet student distillation configuration (SPOS student search stage)
+#
+# Pass these values via CLI flags to `visdrone-det distill-supernet`.
+# The teacher must be a fine-tuned YOLOv26x checkpoint; download it from the
+# W&B artifact `yolov26x-visdrone-teacher` and pass the local path.
+#
+# Search space (documented here; not consumed directly by distill.py):
+#   backbone_depth_choices: [1, 2, 3]   per stage (×4 stages)
+#   neck_depth_choices:     [1, 2]       per stage (×4 stages)
+#   total_architectures:    3^4 × 2^4 = 1,296 sub-networks
+
+teacher_weights: "/kaggle/working/teacher/best.pt"   # local path to teacher .pt
+epochs: 50
+imgsz: 640
+batch: 8
+workers: 4
+device: "0,1"          # 2× T4 via DataParallel on Kaggle
+
+lr0: 0.001             # initial learning rate (AdamW)
+lrf: 0.01              # final LR = lr0 × lrf (cosine decay after warmup)
+weight_decay: 0.0005
+warmup_epochs: 3
+
+# Distillation loss weights
+# Tune these once on the supernet; freeze for all downstream student runs.
+distill_weight: 1.0    # lambda for MSE(student P3/P4/P5, teacher P3/P4/P5)
+task_weight: 1.0       # lambda for simplified detection loss (BCE + GIoU)
+
+cache: false
+resume: false          # set true to continue from supernet_last.pt in work-dir
+
+wandb_project: distillNas
+run_name: supernet-distill
+
+# Paths set at runtime by the Kaggle kernel script:
+# --data-root /kaggle/input/datasets/banuprasadb/visdrone-dataset
+# --work-dir  /kaggle/working/distillnas-supernet-distill

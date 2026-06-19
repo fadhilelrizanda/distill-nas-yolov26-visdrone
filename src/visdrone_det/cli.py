@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from .benchmark import run_yolov26x_benchmark
+from .distill import run_supernet_distill
 from .finetune import run_yolov26x_finetune
 from .infer import run_yolov26x_inference
 
@@ -62,6 +63,67 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--wandb-project", default="distillNas")
     finetune.add_argument("--wandb-entity", default=None)
     finetune.add_argument("--run-name", default=None)
+
+    distill = subparsers.add_parser(
+        "distill-supernet",
+        help="Train YOLO supernet student with feature KD from YOLOv26x teacher",
+    )
+    distill.add_argument(
+        "--data-root",
+        type=Path,
+        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
+    )
+    distill.add_argument(
+        "--work-dir",
+        type=Path,
+        default=Path("/kaggle/working/distillnas-supernet-distill"),
+    )
+    distill.add_argument(
+        "--teacher-weights",
+        default="yolov26x-visdrone-teacher:best.pt",
+        help="Local .pt path or Ultralytics model name for teacher weights",
+    )
+    distill.add_argument("--epochs", type=int, default=50)
+    distill.add_argument("--imgsz", type=int, default=640)
+    distill.add_argument("--batch", type=int, default=8)
+    distill.add_argument("--workers", type=int, default=4)
+    distill.add_argument("--device", default="0,1")
+    distill.add_argument("--lr0", type=float, default=0.001)
+    distill.add_argument("--lrf", type=float, default=0.01)
+    distill.add_argument("--weight-decay", type=float, default=0.0005)
+    distill.add_argument("--warmup-epochs", type=int, default=3)
+    distill.add_argument(
+        "--distill-weight",
+        type=float,
+        default=1.0,
+        help="Lambda weight for MSE feature distillation loss",
+    )
+    distill.add_argument(
+        "--task-weight",
+        type=float,
+        default=1.0,
+        help="Lambda weight for detection task loss",
+    )
+    distill.add_argument(
+        "--pretrained-backbone",
+        default=None,
+        metavar="WEIGHTS",
+        help=(
+            "Pretrained YOLO weights to initialize the supernet backbone/neck "
+            "(e.g. 'yolo26s.pt'). Skipped when --resume is used. "
+            "Layers whose shapes differ from the pretrained model are kept random."
+        ),
+    )
+    distill.add_argument("--cache", action="store_true", default=False)
+    distill.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+        help="Resume from supernet_last.pt in --work-dir",
+    )
+    distill.add_argument("--wandb-project", default="distillNas")
+    distill.add_argument("--wandb-entity", default=None)
+    distill.add_argument("--run-name", default=None)
 
     return parser
 
@@ -121,6 +183,30 @@ def main(argv: list[str] | None = None) -> int:
             wandb_entity=args.wandb_entity,
             run_name=args.run_name,
             live_batch_log=args.live_batch_log,
+        )
+        return 0
+    if args.command == "distill-supernet":
+        run_supernet_distill(
+            data_root=args.data_root,
+            work_dir=args.work_dir,
+            teacher_weights=args.teacher_weights,
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            workers=args.workers,
+            device=args.device,
+            lr0=args.lr0,
+            lrf=args.lrf,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            distill_weight=args.distill_weight,
+            task_weight=args.task_weight,
+            pretrained_backbone=args.pretrained_backbone,
+            cache=args.cache,
+            resume=args.resume,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            run_name=args.run_name,
         )
         return 0
     parser.error(f"unknown command: {args.command}")
