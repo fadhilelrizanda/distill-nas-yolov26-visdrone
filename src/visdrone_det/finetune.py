@@ -230,10 +230,14 @@ def run_yolov26x_finetune(
 
     metrics: dict[str, Any] = {}
     try:
-        # If resume is requested and a previous last.pt exists in results, use it.
-        last_pt_resume = results_dir / "yolov26x_visdrone_finetune" / "weights" / "last.pt"
-        if resume and last_pt_resume.exists():
-            model = YOLO(str(last_pt_resume))
+        # Resume checkpoint lookup: check a dedicated dir first (outside Ultralytics save_dir
+        # so trainer init can't accidentally remove it), then fall back to weights dir.
+        resume_ckpt = work_dir / "resume_checkpoint" / "last.pt"
+        weights_ckpt = results_dir / "yolov26x_visdrone_finetune" / "weights" / "last.pt"
+        if resume and resume_ckpt.exists():
+            model = YOLO(str(resume_ckpt))
+        elif resume and weights_ckpt.exists():
+            model = YOLO(str(weights_ckpt))
         else:
             model = YOLO(model_name)
 
