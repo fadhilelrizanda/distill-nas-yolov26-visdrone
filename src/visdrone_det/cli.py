@@ -9,6 +9,7 @@ from .benchmark import run_yolov26x_benchmark
 from .distill import run_supernet_distill
 from .finetune import run_yolov26x_finetune
 from .infer import run_yolov26x_inference
+from .search import run_student_search
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,10 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--warmup-epochs", type=int, default=3)
     finetune.add_argument("--cache", action="store_true", default=False)
     finetune.add_argument("--resume", action="store_true", default=False)
+    finetune.add_argument("--save-period", type=int, default=-1,
+                         help="Save epoch{N}.pt every N epochs (-1 disables, saves only last.pt/best.pt)")
     finetune.add_argument("--live-batch-log", action="store_true", default=False,
                          help="Log per-batch training losses to W&B (noisy, for debugging)")
     finetune.add_argument("--wandb-project", default="distillNas")
     finetune.add_argument("--wandb-entity", default=None)
+    finetune.add_argument("--wandb-run-id", default=None,
+                         help="W&B run ID to resume (uses resume='allow' to continue existing run)")
     finetune.add_argument("--run-name", default=None)
 
     distill = subparsers.add_parser(
@@ -125,6 +130,52 @@ def build_parser() -> argparse.ArgumentParser:
     distill.add_argument("--wandb-entity", default=None)
     distill.add_argument("--run-name", default=None)
 
+    search = subparsers.add_parser(
+        "search-student",
+        help="Search the trained supernet for the best sub-architecture (Stage 3 NAS)",
+    )
+    search.add_argument(
+        "--supernet-weights",
+        default="yolov26x-supernet-student:supernet_best.pt",
+        help="Path to supernet_best.pt from distill-supernet, or W&B artifact ref",
+    )
+    search.add_argument(
+        "--work-dir",
+        type=Path,
+        default=Path("/kaggle/working/distillnas-student-search"),
+    )
+    search.add_argument(
+        "--n-samples",
+        type=int,
+        default=50,
+        help="Number of random sub-architectures to evaluate (random search only)",
+    )
+    search.add_argument(
+        "--search-mode",
+        choices=["random", "exhaustive"],
+        default="random",
+        help="'random': sample n-samples; 'exhaustive': evaluate all 1,296 sub-networks",
+    )
+    search.add_argument("--imgsz", type=int, default=320)
+    search.add_argument("--batch", type=int, default=4)
+    search.add_argument(
+        "--n-proxy-batches",
+        type=int,
+        default=4,
+        help="Number of random batches to average proxy score over per architecture",
+    )
+    search.add_argument("--device", default="0")
+    search.add_argument("--seed", type=int, default=42)
+    search.add_argument(
+        "--dummy-weights",
+        action="store_true",
+        default=False,
+        help="Skip loading supernet weights and use random init (for testing)",
+    )
+    search.add_argument("--wandb-project", default="distillNas")
+    search.add_argument("--wandb-entity", default=None)
+    search.add_argument("--run-name", default=None)
+
     return parser
 
 
@@ -179,8 +230,10 @@ def main(argv: list[str] | None = None) -> int:
             warmup_epochs=args.warmup_epochs,
             cache=args.cache,
             resume=args.resume,
+            save_period=args.save_period,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
+            wandb_run_id=args.wandb_run_id,
             run_name=args.run_name,
             live_batch_log=args.live_batch_log,
         )
@@ -204,6 +257,23 @@ def main(argv: list[str] | None = None) -> int:
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
             resume=args.resume,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            run_name=args.run_name,
+        )
+        return 0
+    if args.command == "search-student":
+        run_student_search(
+            supernet_weights=args.supernet_weights,
+            work_dir=args.work_dir,
+            n_samples=args.n_samples,
+            search_mode=args.search_mode,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            n_proxy_batches=args.n_proxy_batches,
+            device=args.device,
+            seed=args.seed,
+            dummy_weights=args.dummy_weights,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             run_name=args.run_name,

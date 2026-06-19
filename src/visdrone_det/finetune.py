@@ -111,8 +111,10 @@ def run_yolov26x_finetune(
     warmup_epochs: int = 3,
     cache: bool = False,
     resume: bool = False,
+    save_period: int = -1,
     wandb_project: str = "distillNas",
     wandb_entity: str | None = None,
+    wandb_run_id: str | None = None,
     run_name: str | None = None,
     live_batch_log: bool = False,
 ) -> dict[str, Any]:
@@ -184,7 +186,7 @@ def run_yolov26x_finetune(
         "python": platform.python_version(),
     }
 
-    wandb_run = wandb.init(
+    wandb_init_kwargs: dict[str, Any] = dict(
         project=wandb_project,
         entity=wandb_entity,
         name=run_name,
@@ -192,6 +194,10 @@ def run_yolov26x_finetune(
         tags=["visdrone", "yolov26x", "finetune", "teacher", "kaggle"],
         config=config,
     )
+    if wandb_run_id:
+        wandb_init_kwargs["resume"] = "allow"
+        wandb_init_kwargs["id"] = wandb_run_id
+    wandb_run = wandb.init(**wandb_init_kwargs)
 
     # ------------------------------------------------------------------
     # DDP-aware W&B logging
@@ -249,7 +255,7 @@ def run_yolov26x_finetune(
             name="yolov26x_visdrone_finetune",
             exist_ok=True,
             save=True,
-            save_period=1,  # epoch{N}.pt on disk every epoch
+            save_period=save_period,
             plots=True,
             verbose=True,
         )
