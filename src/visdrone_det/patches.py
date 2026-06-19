@@ -133,9 +133,9 @@ def patch_generate_ddp_file(
 ) -> None:
     """Monkey-patch Ultralytics' DDP file generator to inject W&B callbacks.
 
-    The patched version writes the original generated temp file, then appends
-    *INJECTION_TEMPLATE* to it.  The injected code runs in the DDP subprocess after
-    the trainer is created but before ``trainer.train()`` is called.
+    The patched version writes the original generated temp file, then inserts
+    *INJECTION_TEMPLATE* into it just before ``trainer.train()`` is called.
+    This ensures the custom W&B callbacks are registered *before* training begins.
 
     Parameters
     ----------
@@ -158,8 +158,18 @@ def patch_generate_ddp_file(
             checkpoint_interval=checkpoint_interval,
             live_batch_log="True" if live_batch_log else "False",
         )
-        with open(path, "a", encoding="utf-8") as f:
-            f.write("\n" + code + "\n")
+        # IMPORTANT: insert the injection BEFORE "results = trainer.train()",
+        # not at the end of the file — otherwise the callbacks are registered
+        # after training complete and never fire.
+        with open(path, encoding="utf-8") as f:
+            original_content = f.read()
+        original_content = original_content.replace(
+            "results = trainer.train()",
+            f"{code}\nresults = trainer.train()",
+            1,
+        )
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(original_content)
         return path
 
     dist_module.generate_ddp_file = _patched
