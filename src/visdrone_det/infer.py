@@ -91,17 +91,10 @@ def run_yolov26x_inference(
     try:
         model = YOLO(model_name)
 
-        probe = cv2.imread(str(image_paths[0]))
-        if probe is None:
-            raise RuntimeError(f"Could not read image: {image_paths[0]}")
-        img_h, img_w = probe.shape[:2]
-
-        writer = cv2.VideoWriter(
-            str(video_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (img_w, img_h + _INFO_BAR_H),
-        )
+        # Lazy VideoWriter init: use actual orig_img dimensions from the first result
+        # rather than a probe read, because YOLO may store orig_img at a different
+        # resolution than what cv2.imread returns (e.g. half-res cache).
+        writer = None
 
         written = 0
         for result in model.predict(
@@ -113,7 +106,7 @@ def run_yolov26x_inference(
             stream=True,
             verbose=False,
         ):
-            raw = result.orig_img  # BGR, native resolution
+            raw = result.orig_img  # BGR, native resolution as stored by YOLO
             label_path = prepared.labels / f"{Path(result.path).stem}.txt"
 
             frame, gt_n, pred_n = _compose_frame(
@@ -124,8 +117,17 @@ def run_yolov26x_inference(
                 frame_idx=written,
                 total_frames=frame_count,
                 conf_thresh=conf,
-                img_w=img_w,
             )
+
+            if writer is None:
+                fh, fw = frame.shape[:2]
+                writer = cv2.VideoWriter(
+                    str(video_path),
+                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    fps,
+                    (fw, fh),
+                )
+
             writer.write(frame)
 
             if written in sample_indices:
@@ -140,7 +142,8 @@ def run_yolov26x_inference(
             if written % 50 == 0:
                 print(f"  wrote {written}/{frame_count} frames", flush=True)
 
-        writer.release()
+        if writer is not None:
+            writer.release()
         print(f"Video saved: {video_path} ({written} frames)", flush=True)
 
         wandb_run.log({
@@ -189,13 +192,12 @@ def _compose_frame(
     frame_idx: int,
     total_frames: int,
     conf_thresh: float,
-    img_w: int,
 ) -> tuple[Any, int, int]:
     """Return (annotated_frame_with_info_bar, gt_count, pred_count)."""
     import cv2
     import numpy as np
 
-    img_h = img.shape[0]
+    img_h, img_w = img.shape[:2]  # always use actual frame dimensions
     frame = img.copy()
 
     # --- Ground-truth boxes (dashed green) ---
