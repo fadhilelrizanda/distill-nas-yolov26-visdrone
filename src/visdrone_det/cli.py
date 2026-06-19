@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .benchmark import run_yolov26x_benchmark
 from .finetune import run_yolov26x_finetune
+from .infer import run_yolov26x_inference
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +25,20 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--wandb-project", default="distillNas")
     benchmark.add_argument("--wandb-entity", default=None)
     benchmark.add_argument("--run-name", default=None)
+
+    infer = subparsers.add_parser("infer-yolov26x", help="Run YOLOv26x inference on VisDrone val, save annotated video to W&B")
+    infer.add_argument("--data-root", type=Path, default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"))
+    infer.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-yolov26x-infer"))
+    infer.add_argument("--split", default="val")
+    infer.add_argument("--model", default="yolo26x.pt")
+    infer.add_argument("--imgsz", type=int, default=640)
+    infer.add_argument("--conf", type=float, default=0.25)
+    infer.add_argument("--device", default="0")
+    infer.add_argument("--max-frames", type=int, default=300)
+    infer.add_argument("--fps", type=float, default=5.0)
+    infer.add_argument("--wandb-project", default="distillNas")
+    infer.add_argument("--wandb-entity", default=None)
+    infer.add_argument("--run-name", default=None)
 
     finetune = subparsers.add_parser("finetune-yolov26x", help="Fine-tune YOLOv26x on VisDrone train split (teacher stage)")
     finetune.add_argument("--data-root", type=Path, default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"))
@@ -52,6 +67,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "infer-yolov26x":
+        run_yolov26x_inference(
+            data_root=args.data_root,
+            work_dir=args.work_dir,
+            split=args.split,
+            model_name=args.model,
+            imgsz=args.imgsz,
+            conf=args.conf,
+            device=args.device,
+            max_frames=args.max_frames,
+            fps=args.fps,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            run_name=args.run_name,
+        )
+        return 0
     if args.command == "benchmark-yolov26x":
         run_yolov26x_benchmark(
             data_root=args.data_root,
