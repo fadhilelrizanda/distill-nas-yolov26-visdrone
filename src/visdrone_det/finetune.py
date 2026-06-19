@@ -57,6 +57,7 @@ def run_yolov26x_finetune(
                 "path": str(dataset_dir),
                 "train": "images/train",
                 "val": "images/val",
+                "nc": len(VISDRONE_NAMES),
                 "names": {idx: name for idx, name in enumerate(VISDRONE_NAMES)},
             },
             sort_keys=False,

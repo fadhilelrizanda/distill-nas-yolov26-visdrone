@@ -126,6 +126,7 @@ def prepare_yolo_dataset(data_root: Path, output_root: Path, split: str = "val")
         "train": f"images/{split}",
         "val": f"images/{split}",
         "test": f"images/{split}",
+        "nc": len(VISDRONE_NAMES),
         "names": {idx: name for idx, name in enumerate(VISDRONE_NAMES)},
     }
     yaml_path.write_text(yaml.safe_dump(yaml_payload, sort_keys=False), encoding="utf-8")
