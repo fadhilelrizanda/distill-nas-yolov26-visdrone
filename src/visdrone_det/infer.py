@@ -98,6 +98,7 @@ def run_yolov26x_inference(
             imgsz=imgsz,
             conf=conf,
             device=device,
+            half=True,
             stream=True,
             verbose=False,
         ):
