@@ -107,7 +107,13 @@ def run_yolov26x_inference(
             verbose=False,
         ):
             raw = result.orig_img  # BGR, native resolution as stored by YOLO
-            label_path = prepared.labels / f"{Path(result.path).stem}.txt"
+            label_path = prepared.labels / f"{image_paths[written].stem}.txt"
+            if written == 0:
+                print(
+                    f"  GT label check: path={label_path}  exists={label_path.exists()}  "
+                    f"labels_dir={prepared.labels}  labels_dir_exists={prepared.labels.exists()}",
+                    flush=True,
+                )
 
             frame, gt_n, pred_n = _compose_frame(
                 img=raw,
