@@ -32,6 +32,7 @@ _INJECTION_TEMPLATE = string.Template(
 # === Custom W&B DDP callbacks (injected by distill-nas/patches.py) ===
 import os
 from pathlib import Path
+from ultralytics.utils import RANK
 
 _WANDB_DDP_RUN_ID = os.environ.get("_WANDB_DDP_RUN_ID")
 _WANDB_DDP_PROJECT = os.environ.get("_WANDB_DDP_PROJECT", "")
@@ -61,7 +62,7 @@ if _WANDB_DDP_RUN_ID:
 
     # -- per-epoch logging ------------------------------------------------
     def _epoch_log(trainer):
-        if trainer.rank not in (-1, 0):
+        if RANK not in (-1, 0):
             return
         _ensure_run()
         epoch = trainer.epoch + 1
@@ -74,7 +75,7 @@ if _WANDB_DDP_RUN_ID:
     if _LIVE_BATCH_LOG:
 
         def _batch_log(trainer):
-            if trainer.rank not in (-1, 0):
+            if RANK not in (-1, 0):
                 return
             _ensure_run()
             step = trainer.epoch * len(trainer.train_loader) + trainer.batch_i
@@ -94,7 +95,7 @@ if _WANDB_DDP_RUN_ID:
 
     # -- checkpoint artifact logging --------------------------------------
     def _checkpoint_log(trainer):
-        if trainer.rank not in (-1, 0):
+        if RANK not in (-1, 0):
             return
         epoch = trainer.epoch + 1
         if _CHECKPOINT_INTERVAL > 0 and epoch % _CHECKPOINT_INTERVAL != 0:
