@@ -100,7 +100,6 @@ def run_yolov26x_inference(
             imgsz=imgsz,
             conf=conf,
             device=device,
-            batch=4,
             half=True,
             stream=True,
             verbose=False,
