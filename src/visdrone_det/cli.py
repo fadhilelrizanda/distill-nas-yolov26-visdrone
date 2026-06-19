@@ -33,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--model", default="yolo26x.pt")
     infer.add_argument("--imgsz", type=int, default=640)
     infer.add_argument("--conf", type=float, default=0.25)
-    infer.add_argument("--device", default="0")
+    infer.add_argument("--device", default="0,1")
     infer.add_argument("--max-frames", type=int, default=300)
     infer.add_argument("--fps", type=float, default=5.0)
     infer.add_argument("--wandb-project", default="distillNas")

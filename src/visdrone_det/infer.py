@@ -19,7 +19,7 @@ def run_yolov26x_inference(
     model_name: str = "yolo26x.pt",
     imgsz: int = 640,
     conf: float = 0.25,
-    device: str = "0",
+    device: str = "0,1",
     max_frames: int = 300,
     fps: float = 5.0,
     wandb_project: str = "distillNas",
@@ -30,6 +30,8 @@ def run_yolov26x_inference(
     import cv2
     from ultralytics import YOLO
     import wandb
+
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     work_dir = work_dir.expanduser().resolve()
     dataset_dir = work_dir / "visdrone_yolo"
@@ -98,6 +100,7 @@ def run_yolov26x_inference(
             imgsz=imgsz,
             conf=conf,
             device=device,
+            batch=4,
             half=True,
             stream=True,
             verbose=False,
