@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from .benchmark import run_yolov26x_benchmark
+from .finetune import run_yolov26x_finetune
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -24,6 +25,27 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--wandb-entity", default=None)
     benchmark.add_argument("--run-name", default=None)
 
+    finetune = subparsers.add_parser("finetune-yolov26x", help="Fine-tune YOLOv26x on VisDrone train split (teacher stage)")
+    finetune.add_argument("--data-root", type=Path, default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"))
+    finetune.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-yolov26x-finetune"))
+    finetune.add_argument("--model", default="yolo26x.pt")
+    finetune.add_argument("--epochs", type=int, default=100)
+    finetune.add_argument("--imgsz", type=int, default=640)
+    finetune.add_argument("--batch", type=int, default=8)
+    finetune.add_argument("--workers", type=int, default=4)
+    finetune.add_argument("--device", default="0,1")
+    finetune.add_argument("--patience", type=int, default=20)
+    finetune.add_argument("--optimizer", default="AdamW")
+    finetune.add_argument("--lr0", type=float, default=0.001)
+    finetune.add_argument("--lrf", type=float, default=0.01)
+    finetune.add_argument("--weight-decay", type=float, default=0.0005)
+    finetune.add_argument("--warmup-epochs", type=int, default=3)
+    finetune.add_argument("--cache", action="store_true", default=False)
+    finetune.add_argument("--resume", action="store_true", default=False)
+    finetune.add_argument("--wandb-project", default="distillNas")
+    finetune.add_argument("--wandb-entity", default=None)
+    finetune.add_argument("--run-name", default=None)
+
     return parser
 
 
@@ -39,6 +61,29 @@ def main(argv: list[str] | None = None) -> int:
             imgsz=args.imgsz,
             batch=args.batch,
             device=args.device,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            run_name=args.run_name,
+        )
+        return 0
+    if args.command == "finetune-yolov26x":
+        run_yolov26x_finetune(
+            data_root=args.data_root,
+            work_dir=args.work_dir,
+            model_name=args.model,
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            workers=args.workers,
+            device=args.device,
+            patience=args.patience,
+            optimizer=args.optimizer,
+            lr0=args.lr0,
+            lrf=args.lrf,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            cache=args.cache,
+            resume=args.resume,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             run_name=args.run_name,

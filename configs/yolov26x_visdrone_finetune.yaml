@@ -1,0 +1,27 @@
+# YOLOv26x VisDrone fine-tuning configuration (teacher stage)
+#
+# Pass this file's values via CLI flags to `visdrone-det finetune-yolov26x`.
+# This config documents the canonical teacher training recipe; it is not
+# consumed directly by Ultralytics — the CLI translates each key to a flag.
+
+model: yolo26x.pt
+epochs: 100
+imgsz: 640
+batch: 8
+workers: 4
+device: "0,1"       # 2x T4 via DDP on Kaggle
+patience: 20        # early-stop if val mAP does not improve for N epochs
+optimizer: AdamW
+lr0: 0.001          # initial learning rate
+lrf: 0.01           # final LR = lr0 * lrf (cosine decay)
+weight_decay: 0.0005
+warmup_epochs: 3
+cache: false        # set true only if Kaggle RAM allows
+resume: false       # set true to resume from last.pt in work-dir
+
+wandb_project: distillNas
+run_name: yolov26x-finetune
+
+# Paths are set at runtime by the Kaggle kernel script:
+# --data-root /kaggle/input/datasets/banuprasadb/visdrone-dataset
+# --work-dir  /kaggle/working/distillnas-yolov26x-finetune
