@@ -8,6 +8,7 @@ from pathlib import Path
 from .benchmark import run_yolov26x_benchmark
 from .distill import run_supernet_distill
 from .distill_famo import run_supernet_distill_famo
+from .distill_famo_mask import run_supernet_distill_famo_mask
 from .finetune import run_yolov26x_finetune
 from .infer import run_yolov26x_inference
 from .search import run_student_search
@@ -173,6 +174,50 @@ def build_parser() -> argparse.ArgumentParser:
     distill_famo.add_argument("--wandb-entity",  default=None)
     distill_famo.add_argument("--run-name",      default=None)
 
+    distill_famo_mask = subparsers.add_parser(
+        "distill-supernet-famo-mask",
+        help="SPOS supernet distillation with FAMO + foreground-masked MSE (NeurIPS 2023 + GT heatmap)",
+    )
+    distill_famo_mask.add_argument(
+        "--data-root", type=Path,
+        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
+    )
+    distill_famo_mask.add_argument(
+        "--work-dir", type=Path,
+        default=Path("/kaggle/working/distillnas-supernet-distill-famo-mask"),
+    )
+    distill_famo_mask.add_argument(
+        "--teacher-weights", default="yolov26x-visdrone-teacher:best.pt",
+        help="Local .pt path or Ultralytics model name for teacher weights",
+    )
+    distill_famo_mask.add_argument("--epochs",        type=int,   default=50)
+    distill_famo_mask.add_argument("--imgsz",         type=int,   default=640)
+    distill_famo_mask.add_argument("--batch",         type=int,   default=8)
+    distill_famo_mask.add_argument("--workers",       type=int,   default=4)
+    distill_famo_mask.add_argument("--device",                    default="0,1")
+    distill_famo_mask.add_argument("--lr0",           type=float, default=0.001)
+    distill_famo_mask.add_argument("--lrf",           type=float, default=0.01)
+    distill_famo_mask.add_argument("--weight-decay",  type=float, default=0.0005)
+    distill_famo_mask.add_argument("--warmup-epochs", type=int,   default=3)
+    distill_famo_mask.add_argument(
+        "--famo-gamma", type=float, default=0.01,
+        help="FAMO weight-update step size (how fast weights adapt to loss changes)",
+    )
+    distill_famo_mask.add_argument(
+        "--mask-sigma", type=float, default=2.0,
+        help="Gaussian sigma in grid cells for the foreground heatmap mask",
+    )
+    distill_famo_mask.add_argument(
+        "--pretrained-backbone", default=None, metavar="WEIGHTS",
+        help="Pretrained YOLO weights to initialize supernet backbone/neck (e.g. 'yolo26s.pt')",
+    )
+    distill_famo_mask.add_argument("--cache",  action="store_true", default=False)
+    distill_famo_mask.add_argument("--resume", action="store_true", default=False,
+                                   help="Resume from supernet_last.pt in --work-dir")
+    distill_famo_mask.add_argument("--wandb-project", default="distillNas")
+    distill_famo_mask.add_argument("--wandb-entity",  default=None)
+    distill_famo_mask.add_argument("--run-name",      default=None)
+
     search = subparsers.add_parser(
         "search-student",
         help="Search the trained supernet for the best sub-architecture (Stage 3 NAS)",
@@ -321,6 +366,30 @@ def main(argv: list[str] | None = None) -> int:
             weight_decay=args.weight_decay,
             warmup_epochs=args.warmup_epochs,
             famo_gamma=args.famo_gamma,
+            pretrained_backbone=args.pretrained_backbone,
+            cache=args.cache,
+            resume=args.resume,
+            wandb_project=args.wandb_project,
+            wandb_entity=args.wandb_entity,
+            run_name=args.run_name,
+        )
+        return 0
+    if args.command == "distill-supernet-famo-mask":
+        run_supernet_distill_famo_mask(
+            data_root=args.data_root,
+            work_dir=args.work_dir,
+            teacher_weights=args.teacher_weights,
+            epochs=args.epochs,
+            imgsz=args.imgsz,
+            batch=args.batch,
+            workers=args.workers,
+            device=args.device,
+            lr0=args.lr0,
+            lrf=args.lrf,
+            weight_decay=args.weight_decay,
+            warmup_epochs=args.warmup_epochs,
+            famo_gamma=args.famo_gamma,
+            mask_sigma=args.mask_sigma,
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
             resume=args.resume,

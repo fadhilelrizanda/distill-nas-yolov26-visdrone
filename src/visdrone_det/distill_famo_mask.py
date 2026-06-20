@@ -1,4 +1,4 @@
-"""Supernet distillation with FAMO automatic loss weighting (Liu et al., NeurIPS 2023)."""
+"""Supernet distillation: FAMO loss weighting + foreground-masked MSE distillation."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .distill import (
     _git_sha,
     _register_teacher_hooks,
 )
+from .distill_famo import _FAMOWeights
 from .supernet import (
     BACKBONE_DEPTH_CHOICES,
     NECK_DEPTH_CHOICES,
@@ -35,84 +36,89 @@ from .supernet import (
 from .visdrone import VISDRONE_NAMES, prepare_yolo_dataset
 
 
-# ── FAMO weight manager ────────────────────────────────────────────────────
+# ── Foreground mask ────────────────────────────────────────────────────────
 
 
-class _FAMOWeights:
-    """FAMO adaptive loss weights (Liu et al., NeurIPS 2023).
+@torch.no_grad()
+def _fg_mask(
+    targets: torch.Tensor,
+    grid_h: int,
+    grid_w: int,
+    batch_size: int,
+    sigma: float = 2.0,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """Build a Gaussian foreground heatmap from GT box centers.
 
-    Maintains n weights that sum to 1. After each optimizer step, a no-grad
-    forward pass measures the new losses; weights are updated so that losses
-    with smaller decrease receive higher weight next step — equalizing the
-    rate of progress across all loss components.
+    For each GT box the heatmap peaks at 1.0 at the center grid cell and
+    falls off as a 2-D Gaussian with the given sigma (in grid cells).
+    Multiple GT boxes are combined by pixel-wise max.
+
+    Returns [B, 1, Gh, Gw] float32 with values in [0, 1].
+    Empty targets → all-zero mask → distillation loss zeroed out for that image.
     """
+    mask = torch.zeros(batch_size, 1, grid_h, grid_w, device=device)
+    if targets.numel() == 0:
+        return mask
 
-    def __init__(
-        self,
-        n: int = 4,
-        gamma: float = 0.01,
-        device: str | torch.device = "cpu",
-    ) -> None:
-        self.w = torch.ones(n, device=device) / n
-        self.gamma = gamma
-        self._l_prev: torch.Tensor | None = None
+    # Integer grid coordinate meshes: gy [Gh, 1], gx [1, Gw]
+    gy = torch.arange(grid_h, device=device, dtype=torch.float32).unsqueeze(1)
+    gx = torch.arange(grid_w, device=device, dtype=torch.float32).unsqueeze(0)
 
-    def weighted_loss(self, losses: list[torch.Tensor]) -> torch.Tensor:
-        """Return FAMO-weighted sum; cache current loss values for update."""
-        l = torch.stack([x.detach() for x in losses])
-        self._l_prev = l
-        return sum(self.w[i] * losses[i] for i in range(len(losses)))  # type: ignore[return-value]
+    denom = 2.0 * sigma * sigma
+    for row in targets:
+        b   = int(row[0].item())
+        cx_n = row[2].item()
+        cy_n = row[3].item()
+        ci = cy_n * grid_h   # float center row in grid space
+        cj = cx_n * grid_w   # float center col in grid space
+        heat = torch.exp(-((gy - ci) ** 2 + (gx - cj) ** 2) / denom)  # [Gh, Gw]
+        mask[b, 0] = torch.max(mask[b, 0], heat)
 
-    @torch.no_grad()
-    def step(self, losses_new: list[torch.Tensor]) -> None:
-        """Update weights from loss change measured after the gradient step.
-
-        Losses that decreased less (or increased) get upweighted.
-        Losses that decreased quickly get downweighted.
-        """
-        if self._l_prev is None:
-            return
-        l_new = torch.stack([x.detach() for x in losses_new])
-        delta = l_new - self._l_prev          # positive → loss went up / stagnated
-        log_w = torch.log(self.w.clamp(min=1e-8))
-        # z_new = z_old + γ·Δl: tasks whose loss decreased (Δl<0) get downweighted
-        self.w = torch.softmax(log_w + self.gamma * delta, dim=0)
-        self._l_prev = None
-
-    def state_dict(self) -> dict[str, Any]:
-        return {"w": self.w.tolist(), "gamma": self.gamma}
-
-    def load_state_dict(self, d: dict[str, Any]) -> None:
-        self.w = torch.tensor(d["w"], device=self.w.device)
-        self.gamma = float(d["gamma"])
+    return mask
 
 
 # ── Loss helpers ───────────────────────────────────────────────────────────
 
 
-def _compute_losses(
+def _compute_losses_masked(
     preds: list[tuple[torch.Tensor, torch.Tensor]],
     student_feats: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     targets: torch.Tensor,
     imgsz: int,
     task_loss_fn: _TaskLoss,
+    mask_sigma: float = 2.0,
 ) -> list[torch.Tensor]:
-    """Return [L_task, L_p3, L_p4, L_p5] — all scalar tensors on student device."""
+    """Return [L_task, L_p3, L_p4, L_p5] with foreground-masked distillation MSE.
+
+    Each distillation loss is MSE weighted by a Gaussian heatmap built from
+    GT box centers, so background cells contribute almost nothing.
+    """
     L_task = task_loss_fn(preds, targets, imgsz)
     out: list[torch.Tensor] = [L_task]
-    for s_feat, key in zip(student_feats, ("P3", "P4", "P5")):
+    B = student_feats[0].shape[0]
+    strides = [8, 16, 32]
+    for s_feat, key, stride in zip(student_feats, ("P3", "P4", "P5"), strides):
         t_feat = _TEACHER_FEAT_STORE.get(key)
-        if t_feat is not None:
-            out.append(F.mse_loss(s_feat, t_feat.to(s_feat.device)))
-        else:
+        if t_feat is None:
             out.append(s_feat.new_tensor(0.0))
+            continue
+        gh, gw = imgsz // stride, imgsz // stride
+        mask = _fg_mask(
+            targets, gh, gw, B, sigma=mask_sigma, device=s_feat.device
+        )  # [B, 1, Gh, Gw]
+        diff2 = (s_feat - t_feat.to(s_feat.device)) ** 2  # [B, C, Gh, Gw]
+        C = s_feat.shape[1]
+        # Average over foreground-weighted cells and channels
+        masked_mse = (diff2 * mask).sum() / (mask.sum().clamp(min=1.0) * C)
+        out.append(masked_mse)
     return out  # length 4
 
 
 # ── Main entrypoint ────────────────────────────────────────────────────────
 
 
-def run_supernet_distill_famo(
+def run_supernet_distill_famo_mask(
     data_root: Path,
     work_dir: Path,
     teacher_weights: str = "yolov26x-visdrone-teacher:best.pt",
@@ -126,6 +132,7 @@ def run_supernet_distill_famo(
     weight_decay: float = 0.0005,
     warmup_epochs: int = 3,
     famo_gamma: float = 0.01,
+    mask_sigma: float = 2.0,
     pretrained_backbone: str | None = None,
     cache: bool = False,
     resume: bool = False,
@@ -133,21 +140,20 @@ def run_supernet_distill_famo(
     wandb_entity: str | None = None,
     run_name: str | None = None,
 ) -> dict[str, Any]:
-    """Train the YOLO supernet student with FAMO-weighted feature distillation.
+    """Train the YOLO supernet with FAMO weighting + foreground-masked distillation.
 
-    Implements Single-Path One-Shot (SPOS) with FAMO (NeurIPS 2023) to
-    automatically balance four loss components per training step:
-    L_task (detection BCE+GIoU), L_p3/L_p4/L_p5 (MSE feature distillation).
-
-    FAMO keeps a no-grad re-forward after each gradient step to measure loss
-    changes, then updates weights so slower-progressing losses receive more
-    attention next step.
+    Combines two novelties on top of SPOS:
+    - FAMO (NeurIPS 2023): adaptively balances [L_task, L_p3, L_p4, L_p5].
+    - Foreground mask: each distillation MSE is weighted by a Gaussian heatmap
+      from GT box centers so background cells are suppressed.
 
     Parameters
     ----------
     famo_gamma:
-        FAMO weight-update step size. Higher values make weights adapt faster.
-        Default 0.01 is conservative; try 0.05–0.1 for faster adaptation.
+        FAMO weight-update step size. Higher = faster weight adaptation.
+    mask_sigma:
+        Gaussian sigma in grid cells for the foreground heatmap.
+        sigma=2.0 → ~5 cell effective radius on the 80×80 P3 grid.
     """
     from ultralytics import YOLO
     import wandb
@@ -179,14 +185,14 @@ def run_supernet_distill_famo(
     )
 
     # ── Teacher ────────────────────────────────────────────────────────────
-    print(f"[distill-famo] loading teacher from {teacher_weights!r}")
+    print(f"[distill-famo-mask] loading teacher from {teacher_weights!r}")
     teacher = YOLO(teacher_weights)
     teacher_nn: nn.Module = teacher.model
     teacher_nn.eval()
     for p in teacher_nn.parameters():
         p.requires_grad_(False)
 
-    print("[distill-famo] probing teacher FPN layer shapes …")
+    print("[distill-famo-mask] probing teacher FPN layer shapes …")
     fpn_modules, teacher_ch = _find_fpn_layers(teacher_nn, imgsz=imgsz)
     t_channels = (
         teacher_ch.get("P3", _DEFAULT_T_P3),
@@ -194,7 +200,7 @@ def run_supernet_distill_famo(
         teacher_ch.get("P5", _DEFAULT_T_P5),
     )
     print(
-        f"[distill-famo] teacher FPN channels: "
+        f"[distill-famo-mask] teacher FPN channels: "
         f"P3={t_channels[0]}, P4={t_channels[1]}, P5={t_channels[2]}"
     )
 
@@ -215,7 +221,7 @@ def run_supernet_distill_famo(
     start_epoch = 0
     ckpt: dict[str, Any] = {}
     if resume and last_ckpt.exists():
-        print(f"[distill-famo] resuming from {last_ckpt}")
+        print(f"[distill-famo-mask] resuming from {last_ckpt}")
         ckpt = torch.load(last_ckpt, map_location="cpu")
         supernet.load_state_dict(ckpt["supernet_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -259,12 +265,14 @@ def run_supernet_distill_famo(
 
     # ── W&B init ──────────────────────────────────────────────────────────
     git_sha = _git_sha(Path.cwd())
-    run_name = run_name or "supernet-distill-famo"
+    run_name = run_name or "supernet-distill-famo-mask"
 
     config = {
         "model": "YOLOSupernet",
         "loss_weighting": "FAMO",
+        "distill_masking": "foreground_gaussian",
         "famo_gamma": famo_gamma,
+        "mask_sigma": mask_sigma,
         "teacher_weights": teacher_weights,
         "teacher_channels": {
             "P3": t_channels[0], "P4": t_channels[1], "P5": t_channels[2]
@@ -296,8 +304,8 @@ def run_supernet_distill_famo(
         project=wandb_project,
         entity=wandb_entity,
         name=run_name,
-        job_type="supernet-distill-famo",
-        tags=["visdrone", "supernet", "spos", "kd", "distill", "famo", "kaggle"],
+        job_type="supernet-distill-famo-mask",
+        tags=["visdrone", "supernet", "spos", "kd", "distill", "famo", "fg-mask", "kaggle"],
         config=config,
         resume="allow" if resume else None,
     )
@@ -318,10 +326,9 @@ def run_supernet_distill_famo(
             epoch_loss_p4    = 0.0
             epoch_loss_p5    = 0.0
             num_batches = 0
-            arch = inner.sample_arch()  # fallback for logging if loader is empty
+            arch = inner.sample_arch()
 
             for images, targets in train_loader:
-                # SPOS: new random sub-architecture every step
                 arch = inner.sample_arch()
                 inner.set_arch(arch)
 
@@ -336,9 +343,11 @@ def run_supernet_distill_famo(
                 # ② Student forward
                 preds, student_feats = supernet(images)
 
-                # ③ Compute 4 losses; FAMO produces weighted sum
-                losses = _compute_losses(preds, student_feats, targets, imgsz, task_loss_fn)
-                _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
+                # ③ Compute 4 foreground-masked losses; FAMO produces weighted sum
+                losses = _compute_losses_masked(
+                    preds, student_feats, targets, imgsz, task_loss_fn,
+                    mask_sigma=mask_sigma,
+                )
                 L_total = famo.weighted_loss(losses)
 
                 # ④ Backward + gradient step
@@ -350,10 +359,10 @@ def run_supernet_distill_famo(
                 with torch.no_grad():
                     teacher_nn(images)
                     preds2, feats2 = supernet(images)
-                    losses2 = _compute_losses(
-                        preds2, feats2, targets, imgsz, task_loss_fn
+                    losses2 = _compute_losses_masked(
+                        preds2, feats2, targets, imgsz, task_loss_fn,
+                        mask_sigma=mask_sigma,
                     )
-                    _TEACHER_FEAT_STORE.clear()  # free re-forward teacher features
                 famo.step(losses2)
 
                 epoch_loss_total += L_total.item()
@@ -364,8 +373,6 @@ def run_supernet_distill_famo(
                 num_batches += 1
 
             scheduler.step()
-            if use_cuda:
-                torch.cuda.empty_cache()  # defragment CUDA allocator pool each epoch
 
             nb = max(1, num_batches)
             avg_total = epoch_loss_total / nb
@@ -390,6 +397,8 @@ def run_supernet_distill_famo(
                 "arch/backbone_depths":   str(arch.backbone_depths),
                 "arch/neck_depths":       str(arch.neck_depths),
             }
+            if epoch == start_epoch:
+                log["distill/mask_sigma"] = mask_sigma
             wandb.log(log, step=epoch + 1)
             print(
                 f"[epoch {epoch + 1:3d}/{epochs}] "
@@ -429,11 +438,11 @@ def run_supernet_distill_famo(
 
         if best_ckpt.exists():
             artifact = wandb.Artifact(
-                name="yolov26x-supernet-student-famo",
+                name="yolov26x-supernet-student-famo-mask",
                 type="model",
                 description=(
-                    "SPOS supernet student trained with FAMO-weighted feature KD "
-                    "(task + P3/P4/P5 MSE) from YOLOv26x teacher on VisDrone"
+                    "SPOS supernet student trained with FAMO-weighted foreground-masked "
+                    "feature KD (task + masked P3/P4/P5 MSE) from YOLOv26x teacher on VisDrone"
                 ),
                 metadata={**config, **summary_metrics},
             )
@@ -445,7 +454,7 @@ def run_supernet_distill_famo(
     finally:
         wandb.finish()
 
-    metrics_path = work_dir / "supernet_distill_famo_metrics.json"
+    metrics_path = work_dir / "supernet_distill_famo_mask_metrics.json"
     metrics_path.write_text(
         json.dumps(summary_metrics, indent=2, sort_keys=True), encoding="utf-8"
     )
