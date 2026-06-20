@@ -130,6 +130,17 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Resume from supernet_last.pt in --work-dir",
     )
+    distill.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=5,
+        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
+    )
+    distill.add_argument(
+        "--wandb-run-id",
+        default=None,
+        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
+    )
     distill.add_argument("--wandb-project", default="distillNas")
     distill.add_argument("--wandb-entity", default=None)
     distill.add_argument("--run-name", default=None)
@@ -170,6 +181,14 @@ def build_parser() -> argparse.ArgumentParser:
     distill_famo.add_argument("--cache",  action="store_true", default=False)
     distill_famo.add_argument("--resume", action="store_true", default=False,
                               help="Resume from supernet_last.pt in --work-dir")
+    distill_famo.add_argument(
+        "--checkpoint-interval", type=int, default=5,
+        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
+    )
+    distill_famo.add_argument(
+        "--wandb-run-id", default=None,
+        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
+    )
     distill_famo.add_argument("--wandb-project", default="distillNas")
     distill_famo.add_argument("--wandb-entity",  default=None)
     distill_famo.add_argument("--run-name",      default=None)
@@ -214,6 +233,14 @@ def build_parser() -> argparse.ArgumentParser:
     distill_famo_mask.add_argument("--cache",  action="store_true", default=False)
     distill_famo_mask.add_argument("--resume", action="store_true", default=False,
                                    help="Resume from supernet_last.pt in --work-dir")
+    distill_famo_mask.add_argument(
+        "--checkpoint-interval", type=int, default=5,
+        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
+    )
+    distill_famo_mask.add_argument(
+        "--wandb-run-id", default=None,
+        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
+    )
     distill_famo_mask.add_argument("--wandb-project", default="distillNas")
     distill_famo_mask.add_argument("--wandb-entity",  default=None)
     distill_famo_mask.add_argument("--run-name",      default=None)
@@ -346,8 +373,10 @@ def main(argv: list[str] | None = None) -> int:
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
             resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
+            wandb_run_id=args.wandb_run_id,
             run_name=args.run_name,
         )
         return 0
@@ -369,8 +398,10 @@ def main(argv: list[str] | None = None) -> int:
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
             resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
+            wandb_run_id=args.wandb_run_id,
             run_name=args.run_name,
         )
         return 0
@@ -393,8 +424,10 @@ def main(argv: list[str] | None = None) -> int:
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
             resume=args.resume,
+            checkpoint_interval=args.checkpoint_interval,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
+            wandb_run_id=args.wandb_run_id,
             run_name=args.run_name,
         )
         return 0

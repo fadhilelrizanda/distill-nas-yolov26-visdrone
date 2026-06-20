@@ -20,6 +20,7 @@ from .distill import (
     _TaskLoss,
     _VisDroneDataset,
     _collate_fn,
+    _eval_student,
     _find_fpn_layers,
     _git_sha,
     _register_teacher_hooks,
@@ -136,8 +137,10 @@ def run_supernet_distill_famo_mask(
     pretrained_backbone: str | None = None,
     cache: bool = False,
     resume: bool = False,
+    checkpoint_interval: int = 5,
     wandb_project: str = "distillNas",
     wandb_entity: str | None = None,
+    wandb_run_id: str | None = None,
     run_name: str | None = None,
 ) -> dict[str, Any]:
     """Train the YOLO supernet with FAMO weighting + foreground-masked distillation.
@@ -147,6 +150,9 @@ def run_supernet_distill_famo_mask(
     - Foreground mask: each distillation MSE is weighted by a Gaussian heatmap
       from GT box centers so background cells are suppressed.
 
+    Per-epoch evaluation runs the max-depth sub-architecture on the VisDrone val
+    split and logs ``val/map50``, ``val/precision``, ``val/recall`` to W&B.
+
     Parameters
     ----------
     famo_gamma:
@@ -154,6 +160,12 @@ def run_supernet_distill_famo_mask(
     mask_sigma:
         Gaussian sigma in grid cells for the foreground heatmap.
         sigma=2.0 → ~5 cell effective radius on the 80×80 P3 grid.
+    checkpoint_interval:
+        Upload ``supernet_last.pt`` as a W&B checkpoint artifact every N epochs
+        (for mid-run resume).  0 disables periodic uploads.
+    wandb_run_id:
+        W&B run ID to resume.  If ``--resume`` is used without this flag, the
+        run ID is loaded from the checkpoint state dict automatically.
     """
     from ultralytics import YOLO
     import wandb
@@ -181,6 +193,19 @@ def run_supernet_distill_famo_mask(
         num_workers=workers,
         pin_memory=True,
         drop_last=True,
+        collate_fn=_collate_fn,
+    )
+    val_loader = DataLoader(
+        _VisDroneDataset(
+            images_dir=val_prepared.images,
+            labels_dir=val_prepared.labels,
+            imgsz=imgsz,
+        ),
+        batch_size=batch,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=True,
+        drop_last=False,
         collate_fn=_collate_fn,
     )
 
@@ -225,6 +250,9 @@ def run_supernet_distill_famo_mask(
         ckpt = torch.load(last_ckpt, map_location="cpu")
         supernet.load_state_dict(ckpt["supernet_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
+        # Recover W&B run ID from checkpoint if not provided on CLI
+        if wandb_run_id is None:
+            wandb_run_id = ckpt.get("wandb_run_id")
     elif pretrained_backbone is not None:
         supernet.load_pretrained_backbone(pretrained_backbone)
 
@@ -300,19 +328,31 @@ def run_supernet_distill_famo_mask(
         "python": platform.python_version(),
     }
 
-    wandb_run = wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        name=run_name,
-        job_type="supernet-distill-famo-mask",
-        tags=["visdrone", "supernet", "spos", "kd", "distill", "famo", "fg-mask", "kaggle"],
-        config=config,
-        resume="allow" if resume else None,
-    )
+    # Resume an existing W&B run when run_id is known; otherwise start fresh.
+    if resume and wandb_run_id:
+        wandb_run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            id=wandb_run_id,
+            resume="must",
+            config=config,
+        )
+    else:
+        wandb_run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            name=run_name,
+            job_type="supernet-distill-famo-mask",
+            tags=["visdrone", "supernet", "spos", "kd", "distill", "famo", "fg-mask", "kaggle"],
+            config=config,
+            resume="allow" if resume else None,
+        )
+    active_wandb_run_id: str = wandb_run.id
 
     # ── Training loop ──────────────────────────────────────────────────────
-    best_loss = float("inf")
-    best_ckpt = ckpt_dir / "supernet_best.pt"
+    best_loss  = float("inf")
+    best_map50 = ckpt.get("best_map50", 0.0)
+    best_ckpt  = ckpt_dir / "supernet_best.pt"
     summary_metrics: dict[str, Any] = {}
 
     try:
@@ -348,6 +388,7 @@ def run_supernet_distill_famo_mask(
                     preds, student_feats, targets, imgsz, task_loss_fn,
                     mask_sigma=mask_sigma,
                 )
+                _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
                 L_total = famo.weighted_loss(losses)
 
                 # ④ Backward + gradient step
@@ -363,6 +404,7 @@ def run_supernet_distill_famo_mask(
                         preds2, feats2, targets, imgsz, task_loss_fn,
                         mask_sigma=mask_sigma,
                     )
+                    _TEACHER_FEAT_STORE.clear()  # free re-forward teacher features
                 famo.step(losses2)
 
                 epoch_loss_total += L_total.item()
@@ -373,6 +415,8 @@ def run_supernet_distill_famo_mask(
                 num_batches += 1
 
             scheduler.step()
+            if use_cuda:
+                torch.cuda.empty_cache()  # defragment CUDA allocator pool each epoch
 
             nb = max(1, num_batches)
             avg_total = epoch_loss_total / nb
@@ -381,6 +425,13 @@ def run_supernet_distill_famo_mask(
             avg_p4    = epoch_loss_p4    / nb
             avg_p5    = epoch_loss_p5    / nb
             current_lr = optimizer.param_groups[0]["lr"]
+
+            # ── Per-epoch val evaluation ───────────────────────────────────
+            val_metrics = _eval_student(
+                supernet, inner, val_loader, imgsz, primary,
+                num_classes=len(VISDRONE_NAMES),
+            )
+            supernet.train()
 
             log = {
                 "epoch":                  epoch + 1,
@@ -396,6 +447,7 @@ def run_supernet_distill_famo_mask(
                 "famo/w_p5":              famo.w[3].item(),
                 "arch/backbone_depths":   str(arch.backbone_depths),
                 "arch/neck_depths":       str(arch.neck_depths),
+                **val_metrics,
             }
             if epoch == start_epoch:
                 log["distill/mask_sigma"] = mask_sigma
@@ -404,7 +456,7 @@ def run_supernet_distill_famo_mask(
                 f"[epoch {epoch + 1:3d}/{epochs}] "
                 f"total={avg_total:.4f} task={avg_task:.4f} "
                 f"p3={avg_p3:.4f} p4={avg_p4:.4f} p5={avg_p5:.4f} "
-                f"lr={current_lr:.2e} "
+                f"lr={current_lr:.2e} mAP50={val_metrics['val/map50']:.4f} "
                 f"famo=[{famo.w[0]:.3f},{famo.w[1]:.3f},{famo.w[2]:.3f},{famo.w[3]:.3f}]"
             )
 
@@ -415,15 +467,34 @@ def run_supernet_distill_famo_mask(
                 "famo":            famo.state_dict(),
                 "arch_last":       arch,
                 "loss_total":      avg_total,
+                "best_map50":      best_map50,
+                "wandb_run_id":    active_wandb_run_id,
             }
             torch.save(state, last_ckpt)
 
+            # Best checkpoint: prefer higher mAP50; fall back to lower loss
+            if val_metrics["val/map50"] > best_map50:
+                best_map50 = val_metrics["val/map50"]
+                state["best_map50"] = best_map50
+                torch.save(state, best_ckpt)
+            elif avg_total < best_loss:
+                torch.save(state, best_ckpt)
             if avg_total < best_loss:
                 best_loss = avg_total
-                torch.save(state, best_ckpt)
+
+            # Periodic resume artifact upload
+            if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
+                resume_art = wandb.Artifact(
+                    name=f"{run_name}-resume",
+                    type="checkpoint",
+                    description=f"Resume checkpoint after epoch {epoch + 1}",
+                )
+                resume_art.add_file(str(last_ckpt), name="supernet_last.pt")
+                wandb_run.log_artifact(resume_art)
 
         summary_metrics = {
             "train/best_loss_total":    best_loss,
+            "val/best_map50":           best_map50,
             "dataset/train_image_count": train_prepared.image_count,
             "dataset/val_image_count":   val_prepared.image_count,
             "dataset/train_label_count": train_prepared.label_count,
