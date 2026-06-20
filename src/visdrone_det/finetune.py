@@ -112,6 +112,7 @@ def run_yolov26x_finetune(
     cache: bool = False,
     resume: bool = False,
     save_period: int = -1,
+    checkpoint_interval: int = 0,
     wandb_project: str = "distillNas",
     wandb_entity: str | None = None,
     wandb_run_id: str | None = None,
@@ -215,7 +216,7 @@ def run_yolov26x_finetune(
     # Environment variables survive subprocess.run() and are the bridge.
     # ------------------------------------------------------------------
     os.environ["_WANDB_METRICS_FILE"] = str(metrics_file)
-    install_patches(checkpoint_interval=1, live_batch_log=live_batch_log)
+    install_patches(checkpoint_interval=checkpoint_interval, live_batch_log=live_batch_log)
 
     # Clean slate for metrics file.
     metrics_file.write_text("", encoding="utf-8")
@@ -223,7 +224,7 @@ def run_yolov26x_finetune(
     stop_event = threading.Event()
     poller_thread = threading.Thread(
         target=_wandb_poller_thread,
-        args=(metrics_file, wandb_run, stop_event, 1),
+        args=(metrics_file, wandb_run, stop_event, checkpoint_interval),
         daemon=True,
     )
     poller_thread.start()

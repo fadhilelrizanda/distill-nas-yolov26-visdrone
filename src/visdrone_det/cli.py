@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--resume", action="store_true", default=False)
     finetune.add_argument("--save-period", type=int, default=-1,
                          help="Save epoch{N}.pt every N epochs (-1 disables, saves only last.pt/best.pt)")
+    finetune.add_argument("--checkpoint-interval", type=int, default=0,
+                         help="Log last.pt as W&B artifact every N epochs (0 disables; avoids disk fill from artifact cache)")
     finetune.add_argument("--live-batch-log", action="store_true", default=False,
                          help="Log per-batch training losses to W&B (noisy, for debugging)")
     finetune.add_argument("--wandb-project", default="distillNas")
@@ -231,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
             cache=args.cache,
             resume=args.resume,
             save_period=args.save_period,
+            checkpoint_interval=args.checkpoint_interval,
             wandb_project=args.wandb_project,
             wandb_entity=args.wandb_entity,
             wandb_run_id=args.wandb_run_id,
