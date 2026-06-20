@@ -591,6 +591,7 @@ def run_supernet_distill(
                 # Losses
                 L_task = task_loss_fn(preds, targets, imgsz)
                 L_distill = _distill_loss(student_feats)
+                _TEACHER_FEAT_STORE.clear()  # free ~171 MB of teacher features before backward
                 L_total = task_weight * L_task + distill_weight * L_distill
 
                 L_total.backward()
@@ -639,6 +640,9 @@ def run_supernet_distill(
             if avg_total < best_loss:
                 best_loss = avg_total
                 torch.save(state, best_ckpt)
+
+            if use_cuda:
+                torch.cuda.empty_cache()  # defragment CUDA allocator pool each epoch
 
         summary_metrics = {
             "train/best_loss_total": best_loss,
