@@ -18,7 +18,7 @@ def test_famo_initial_weights_uniform():
 def test_famo_weights_sum_to_one_after_step():
     famo = _FAMOWeights(n=4, gamma=0.01)
     losses = [torch.tensor(x) for x in [1.0, 0.5, 0.3, 0.2]]
-    famo.weighted_loss(losses)
+    famo.cache_prev(losses)
     losses2 = [torch.tensor(x) for x in [0.9, 0.49, 0.31, 0.19]]
     famo.step(losses2)
     assert abs(famo.w.sum().item() - 1.0) < 1e-5
@@ -27,7 +27,7 @@ def test_famo_weights_sum_to_one_after_step():
 def test_famo_stagnant_loss_gets_higher_weight():
     """A loss that does not decrease should receive a higher weight after update."""
     famo = _FAMOWeights(n=2, gamma=1.0)
-    famo.weighted_loss([torch.tensor(1.0), torch.tensor(1.0)])
+    famo.cache_prev([torch.tensor(1.0), torch.tensor(1.0)])
     # loss[0] drops a lot; loss[1] stays flat
     famo.step([torch.tensor(0.1), torch.tensor(1.0)])
     assert famo.w[1].item() > famo.w[0].item()
@@ -36,7 +36,7 @@ def test_famo_stagnant_loss_gets_higher_weight():
 def test_famo_weights_positive():
     famo = _FAMOWeights(n=4, gamma=0.05)
     losses = [torch.tensor(float(i + 1)) for i in range(4)]
-    famo.weighted_loss(losses)
+    famo.cache_prev(losses)
     losses2 = [torch.tensor(float(i + 1) * 0.9) for i in range(4)]
     famo.step(losses2)
     assert (famo.w > 0).all()
@@ -45,7 +45,7 @@ def test_famo_weights_positive():
 def test_famo_state_dict_roundtrip():
     famo = _FAMOWeights(n=4, gamma=0.05)
     losses = [torch.tensor(float(i + 1)) for i in range(4)]
-    famo.weighted_loss(losses)
+    famo.cache_prev(losses)
     famo.step([torch.tensor(float(i + 1) * 0.9) for i in range(4)])
     sd = famo.state_dict()
 
@@ -57,10 +57,20 @@ def test_famo_state_dict_roundtrip():
 
 def test_famo_step_clears_prev():
     famo = _FAMOWeights(n=2, gamma=0.01)
-    famo.weighted_loss([torch.tensor(1.0), torch.tensor(1.0)])
+    famo.cache_prev([torch.tensor(1.0), torch.tensor(1.0)])
     assert famo._l_prev is not None
     famo.step([torch.tensor(0.9), torch.tensor(0.95)])
     assert famo._l_prev is None
+
+
+def test_famo_w_task_never_below_floor():
+    """w_task (index 0) must stay >= 0.10 even when task loss drops fast."""
+    famo = _FAMOWeights(n=4, gamma=10.0)  # huge gamma to force collapse
+    # task loss drops massively; distill losses stay flat
+    famo.cache_prev([torch.tensor(10.0), torch.tensor(0.1), torch.tensor(0.1), torch.tensor(0.1)])
+    famo.step([torch.tensor(0.001), torch.tensor(0.1), torch.tensor(0.1), torch.tensor(0.1)])
+    assert famo.w[0].item() >= 0.10 - 1e-6
+    assert abs(famo.w.sum().item() - 1.0) < 1e-5
 
 
 def test_compute_losses_returns_four_tensors():

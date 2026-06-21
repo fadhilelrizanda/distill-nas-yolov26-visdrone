@@ -383,12 +383,25 @@ def run_supernet_distill_famo_mask(
                 # ② Student forward
                 preds, student_feats = supernet(images)
 
-                # ③ Compute 4 foreground-masked losses; FAMO produces weighted sum
+                # ③ Compute full-batch foreground-masked training losses (used for gradient)
                 losses = _compute_losses_masked(
                     preds, student_feats, targets, imgsz, task_loss_fn,
                     mask_sigma=mask_sigma,
                 )
                 _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
+
+                # ③b 1-sample l_prev for FAMO — must be on same image as ⑤ so that
+                # delta = l_new - l_prev measures gradient improvement, not batch noise.
+                imgs1 = images[:1]
+                tgts1 = targets[targets[:, 0] == 0]
+                with torch.no_grad():
+                    teacher_nn(imgs1)
+                    p1, f1 = supernet(imgs1)
+                    famo.cache_prev(_compute_losses_masked(
+                        p1, f1, tgts1, imgsz, task_loss_fn, mask_sigma=mask_sigma,
+                    ))
+                    _TEACHER_FEAT_STORE.clear()
+
                 L_total = famo.weighted_loss(losses)
 
                 # ④ Backward + gradient step
@@ -396,18 +409,15 @@ def run_supernet_distill_famo_mask(
                 nn.utils.clip_grad_norm_(supernet.parameters(), max_norm=10.0)
                 optimizer.step()
 
-                # ⑤ FAMO update — single-sample re-forward (no_grad) to measure loss
-                # direction. Batch=1 cuts re-forward peak memory 4× vs full batch.
+                # ⑤ FAMO update — same 1-sample image after gradient step
                 with torch.no_grad():
-                    imgs1 = images[:1]
-                    tgts1 = targets[targets[:, 0] == 0]
                     teacher_nn(imgs1)
                     preds2, feats2 = supernet(imgs1)
                     losses2 = _compute_losses_masked(
                         preds2, feats2, tgts1, imgsz, task_loss_fn,
                         mask_sigma=mask_sigma,
                     )
-                    _TEACHER_FEAT_STORE.clear()  # free re-forward teacher features
+                    _TEACHER_FEAT_STORE.clear()
                 famo.step(losses2)
 
                 epoch_loss_total += L_total.item()

@@ -60,17 +60,23 @@ class _FAMOWeights:
         self._l_prev: torch.Tensor | None = None
 
     def weighted_loss(self, losses: list[torch.Tensor]) -> torch.Tensor:
-        """Return FAMO-weighted sum; cache current loss values for update."""
-        l = torch.stack([x.detach() for x in losses])
-        self._l_prev = l
+        """Return FAMO-weighted sum. Does NOT cache l_prev (call cache_prev separately)."""
         return sum(self.w[i] * losses[i] for i in range(len(losses)))  # type: ignore[return-value]
+
+    def cache_prev(self, losses: list[torch.Tensor]) -> None:
+        """Cache 1-sample losses as l_prev before the gradient step."""
+        self._l_prev = torch.stack([x.detach() for x in losses])
 
     @torch.no_grad()
     def step(self, losses_new: list[torch.Tensor]) -> None:
         """Update weights from loss change measured after the gradient step.
 
+        Both l_prev (set via cache_prev) and losses_new must be from the same
+        1-sample subset so delta measures true gradient improvement, not batch variance.
+
         Losses that decreased less (or increased) get upweighted.
         Losses that decreased quickly get downweighted.
+        w_task (index 0) is floored at 0.10 so detection always keeps gradient.
         """
         if self._l_prev is None:
             return
@@ -78,7 +84,13 @@ class _FAMOWeights:
         delta = l_new - self._l_prev          # positive → loss went up / stagnated
         log_w = torch.log(self.w.clamp(min=1e-8))
         # z_new = z_old + γ·Δl: tasks whose loss decreased (Δl<0) get downweighted
-        self.w = torch.softmax(log_w + self.gamma * delta, dim=0)
+        w_new = torch.softmax(log_w + self.gamma * delta, dim=0)
+        # Floor w_task at 0.10 — detection head must always receive gradient
+        w_task_min = 0.10
+        if w_new[0] < w_task_min:
+            scale = (1.0 - w_task_min) / (1.0 - w_new[0]).clamp(min=1e-8)
+            w_new = torch.cat([w_new.new_tensor([w_task_min]), w_new[1:] * scale])
+        self.w = w_new
         self._l_prev = None
 
     def state_dict(self) -> dict[str, Any]:
@@ -377,9 +389,20 @@ def run_supernet_distill_famo(
                 # ② Student forward
                 preds, student_feats = supernet(images)
 
-                # ③ Compute 4 losses; FAMO produces weighted sum
+                # ③ Compute full-batch training losses (used for gradient)
                 losses = _compute_losses(preds, student_feats, targets, imgsz, task_loss_fn)
                 _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
+
+                # ③b 1-sample l_prev for FAMO — must be on same image as ⑤ so that
+                # delta = l_new - l_prev measures gradient improvement, not batch noise.
+                imgs1 = images[:1]
+                tgts1 = targets[targets[:, 0] == 0]
+                with torch.no_grad():
+                    teacher_nn(imgs1)
+                    p1, f1 = supernet(imgs1)
+                    famo.cache_prev(_compute_losses(p1, f1, tgts1, imgsz, task_loss_fn))
+                    _TEACHER_FEAT_STORE.clear()
+
                 L_total = famo.weighted_loss(losses)
 
                 # ④ Backward + gradient step
@@ -387,17 +410,14 @@ def run_supernet_distill_famo(
                 nn.utils.clip_grad_norm_(supernet.parameters(), max_norm=10.0)
                 optimizer.step()
 
-                # ⑤ FAMO update — single-sample re-forward (no_grad) to measure loss
-                # direction. Batch=1 cuts re-forward peak memory 4× vs full batch.
+                # ⑤ FAMO update — same 1-sample image after gradient step
                 with torch.no_grad():
-                    imgs1 = images[:1]
-                    tgts1 = targets[targets[:, 0] == 0]
                     teacher_nn(imgs1)
                     preds2, feats2 = supernet(imgs1)
                     losses2 = _compute_losses(
                         preds2, feats2, tgts1, imgsz, task_loss_fn
                     )
-                    _TEACHER_FEAT_STORE.clear()  # free re-forward teacher features
+                    _TEACHER_FEAT_STORE.clear()
                 famo.step(losses2)
 
                 epoch_loss_total += L_total.item()
