@@ -117,7 +117,7 @@ def _compute_losses(
     for s_feat, key in zip(student_feats, ("P3", "P4", "P5")):
         t_feat = _TEACHER_FEAT_STORE.get(key)
         if t_feat is not None:
-            out.append(F.mse_loss(s_feat, t_feat.to(s_feat.device)))
+            out.append(F.mse_loss(s_feat, t_feat.to(s_feat.device).to(s_feat.dtype)))
         else:
             out.append(s_feat.new_tensor(0.0))
     return out  # length 4
@@ -243,6 +243,7 @@ def run_supernet_distill_famo(
     primary = torch.device(f"cuda:{device_ids[0]}" if use_cuda else "cpu")
 
     teacher_nn = teacher_nn.to(primary)
+    teacher_nn = teacher_nn.half()  # frozen teacher in fp16; enables imgsz=640 on T4
     _register_teacher_hooks(fpn_modules)
 
     # ── Student supernet ───────────────────────────────────────────────────
@@ -386,7 +387,7 @@ def run_supernet_distill_famo(
 
                 # ① Teacher forward — populates _TEACHER_FEAT_STORE
                 with torch.no_grad():
-                    teacher_nn(images)
+                    teacher_nn(images.half())
 
                 # ② Student forward
                 preds, student_feats = supernet(images)
@@ -400,7 +401,7 @@ def run_supernet_distill_famo(
                 imgs1 = images[:1]
                 tgts1 = targets[targets[:, 0] == 0]
                 with torch.no_grad():
-                    teacher_nn(imgs1)
+                    teacher_nn(imgs1.half())
                     p1, f1 = supernet(imgs1)
                     famo.cache_prev(_compute_losses(p1, f1, tgts1, imgsz, task_loss_fn))
                     _TEACHER_FEAT_STORE.clear()
@@ -414,7 +415,7 @@ def run_supernet_distill_famo(
 
                 # ⑤ FAMO update — same 1-sample image after gradient step
                 with torch.no_grad():
-                    teacher_nn(imgs1)
+                    teacher_nn(imgs1.half())
                     preds2, feats2 = supernet(imgs1)
                     losses2 = _compute_losses(
                         preds2, feats2, tgts1, imgsz, task_loss_fn
