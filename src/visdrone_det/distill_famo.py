@@ -237,7 +237,9 @@ def run_supernet_distill_famo(
     )
 
     device_ids = [int(d.strip()) for d in device.split(",") if d.strip()]
-    use_cuda = torch.cuda.is_available() and len(device_ids) > 0
+    _n_cuda = torch.cuda.device_count()
+    device_ids = [d for d in device_ids if d < _n_cuda]  # drop IDs beyond available GPUs
+    use_cuda = torch.cuda.is_available() and _n_cuda > 0 and len(device_ids) > 0
     primary = torch.device(f"cuda:{device_ids[0]}" if use_cuda else "cpu")
 
     teacher_nn = teacher_nn.to(primary)
