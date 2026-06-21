@@ -284,7 +284,7 @@ class _TaskLoss:
 
     def __init__(self, num_classes: int = 10) -> None:
         self.nc = num_classes
-        self.bce = nn.BCEWithLogitsLoss(reduction="sum")
+        self.bce = nn.BCEWithLogitsLoss(reduction="mean")
 
     def _assign_scale(self, w_n: float, h_n: float, imgsz: int) -> int:
         area = (w_n * imgsz) * (h_n * imgsz)
@@ -358,7 +358,7 @@ class _TaskLoss:
                     torch.stack(gt_boxes),
                 )
 
-        normalizer = float(max(1, num_fg))
+        normalizer = float(len(self._STRIDES))  # cls/box are per-element means; divide by num scales
         return (total_cls + total_box) / normalizer
 
 

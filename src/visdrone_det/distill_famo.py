@@ -387,12 +387,15 @@ def run_supernet_distill_famo(
                 nn.utils.clip_grad_norm_(supernet.parameters(), max_norm=10.0)
                 optimizer.step()
 
-                # ⑤ FAMO update — re-forward (no_grad) to measure new losses
+                # ⑤ FAMO update — single-sample re-forward (no_grad) to measure loss
+                # direction. Batch=1 cuts re-forward peak memory 4× vs full batch.
                 with torch.no_grad():
-                    teacher_nn(images)
-                    preds2, feats2 = supernet(images)
+                    imgs1 = images[:1]
+                    tgts1 = targets[targets[:, 0] == 0]
+                    teacher_nn(imgs1)
+                    preds2, feats2 = supernet(imgs1)
                     losses2 = _compute_losses(
-                        preds2, feats2, targets, imgsz, task_loss_fn
+                        preds2, feats2, tgts1, imgsz, task_loss_fn
                     )
                     _TEACHER_FEAT_STORE.clear()  # free re-forward teacher features
                 famo.step(losses2)
