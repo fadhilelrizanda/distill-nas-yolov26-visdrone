@@ -126,141 +126,106 @@ def _compute_losses(
 # ── Main entrypoint ────────────────────────────────────────────────────────
 
 
-def run_supernet_distill_famo(
+def _run_famo_training_loop(
     data_root: Path,
     work_dir: Path,
-    teacher_weights: str = "yolov26x-visdrone-teacher:best.pt",
-    epochs: int = 50,
-    imgsz: int = 640,
-    batch: int = 8,
-    workers: int = 4,
-    device: str = "0,1",
-    lr0: float = 0.001,
-    lrf: float = 0.01,
-    weight_decay: float = 0.0005,
-    warmup_epochs: int = 3,
-    famo_gamma: float = 0.01,
-    pretrained_backbone: str | None = None,
-    cache: bool = False,
-    resume: bool = False,
-    checkpoint_interval: int = 5,
-    wandb_project: str = "distillNas",
-    wandb_entity: str | None = None,
-    wandb_run_id: str | None = None,
-    run_name: str | None = None,
+    teacher_weights: str,
+    epochs: int,
+    imgsz: int,
+    batch: int,
+    workers: int,
+    device: str,
+    lr0: float,
+    lrf: float,
+    weight_decay: float,
+    warmup_epochs: int,
+    pretrain_epochs: int,
+    famo_gamma: float,
+    pretrained_backbone: str | None,
+    cache: bool,
+    resume: bool,
+    checkpoint_interval: int,
+    wandb_project: str,
+    wandb_entity: str | None,
+    wandb_run_id: str | None,
+    run_name: str | None,
+    *,
+    compute_losses_fn: Any,
+    teacher_half: bool,
+    run_label: str,
+    artifact_name: str,
+    artifact_desc: str,
+    extra_config: dict[str, Any],
+    extra_epoch0_log: dict[str, Any],
+    extra_tags: list[str],
+    metrics_filename: str,
 ) -> dict[str, Any]:
-    """Train the YOLO supernet student with FAMO-weighted feature distillation.
+    """Shared FAMO supernet training loop.
 
-    Implements Single-Path One-Shot (SPOS) with FAMO (NeurIPS 2023) to
-    automatically balance four loss components per training step:
-    L_task (detection BCE+GIoU), L_p3/L_p4/L_p5 (MSE feature distillation).
-
-    FAMO keeps a no-grad re-forward after each gradient step to measure loss
-    changes, then updates weights so slower-progressing losses receive more
-    attention next step.
-
-    Per-epoch evaluation runs the max-depth sub-architecture on the VisDrone val
-    split and logs ``val/map50``, ``val/precision``, ``val/recall`` to W&B.
-
-    Parameters
-    ----------
-    famo_gamma:
-        FAMO weight-update step size. Higher values make weights adapt faster.
-        Default 0.01 is conservative; try 0.05–0.1 for faster adaptation.
-    checkpoint_interval:
-        Upload ``supernet_last.pt`` as a W&B checkpoint artifact every N epochs
-        (for mid-run resume).  0 disables periodic uploads.
-    wandb_run_id:
-        W&B run ID to resume.  If ``--resume`` is used without this flag, the
-        run ID is loaded from the checkpoint state dict automatically.
+    Differentiating parameters (compute_losses_fn, teacher_half, run_label,
+    artifact_name, artifact_desc, extra_config, extra_epoch0_log, extra_tags,
+    metrics_filename) are supplied by per-variant wrapper functions.
     """
     from ultralytics import YOLO
     import wandb
 
+    prefix = f"[distill-{run_label}]"
     work_dir = work_dir.expanduser().resolve()
     dataset_dir = work_dir / "visdrone_yolo"
     ckpt_dir = work_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Dataset ────────────────────────────────────────────────────────────
-    train_prepared = prepare_yolo_dataset(
-        data_root=data_root, output_root=dataset_dir, split="train"
-    )
-    val_prepared = prepare_yolo_dataset(
-        data_root=data_root, output_root=dataset_dir, split="val"
-    )
+    train_prepared = prepare_yolo_dataset(data_root=data_root, output_root=dataset_dir, split="train")
+    val_prepared = prepare_yolo_dataset(data_root=data_root, output_root=dataset_dir, split="val")
     train_loader = DataLoader(
-        _VisDroneDataset(
-            images_dir=train_prepared.images,
-            labels_dir=train_prepared.labels,
-            imgsz=imgsz,
-        ),
-        batch_size=batch,
-        shuffle=True,
-        num_workers=workers,
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=_collate_fn,
+        _VisDroneDataset(images_dir=train_prepared.images, labels_dir=train_prepared.labels, imgsz=imgsz),
+        batch_size=batch, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True, collate_fn=_collate_fn,
     )
     val_loader = DataLoader(
-        _VisDroneDataset(
-            images_dir=val_prepared.images,
-            labels_dir=val_prepared.labels,
-            imgsz=imgsz,
-        ),
-        batch_size=batch,
-        shuffle=False,
-        num_workers=workers,
-        pin_memory=True,
-        drop_last=False,
-        collate_fn=_collate_fn,
+        _VisDroneDataset(images_dir=val_prepared.images, labels_dir=val_prepared.labels, imgsz=imgsz),
+        batch_size=batch, shuffle=False, num_workers=workers, pin_memory=True, drop_last=False, collate_fn=_collate_fn,
     )
 
     # ── Teacher ────────────────────────────────────────────────────────────
-    print(f"[distill-famo] loading teacher from {teacher_weights!r}")
+    print(f"{prefix} loading teacher from {teacher_weights!r}")
     teacher = YOLO(teacher_weights)
     teacher_nn: nn.Module = teacher.model
     teacher_nn.eval()
     for p in teacher_nn.parameters():
         p.requires_grad_(False)
 
-    print("[distill-famo] probing teacher FPN layer shapes …")
+    print(f"{prefix} probing teacher FPN layer shapes …")
     fpn_modules, teacher_ch = _find_fpn_layers(teacher_nn, imgsz=imgsz)
     t_channels = (
         teacher_ch.get("P3", _DEFAULT_T_P3),
         teacher_ch.get("P4", _DEFAULT_T_P4),
         teacher_ch.get("P5", _DEFAULT_T_P5),
     )
-    print(
-        f"[distill-famo] teacher FPN channels: "
-        f"P3={t_channels[0]}, P4={t_channels[1]}, P5={t_channels[2]}"
-    )
+    print(f"{prefix} teacher FPN channels: P3={t_channels[0]}, P4={t_channels[1]}, P5={t_channels[2]}")
 
     device_ids = [int(d.strip()) for d in device.split(",") if d.strip()]
     _n_cuda = torch.cuda.device_count()
-    device_ids = [d for d in device_ids if d < _n_cuda]  # drop IDs beyond available GPUs
+    device_ids = [d for d in device_ids if d < _n_cuda]
     use_cuda = torch.cuda.is_available() and _n_cuda > 0 and len(device_ids) > 0
     primary = torch.device(f"cuda:{device_ids[0]}" if use_cuda else "cpu")
 
     teacher_nn = teacher_nn.to(primary)
-    teacher_nn = teacher_nn.half()  # frozen teacher in fp16; enables imgsz=640 on T4
+    if teacher_half:
+        teacher_nn = teacher_nn.half()  # frozen teacher in fp16; enables imgsz=640 on T4
     _register_teacher_hooks(fpn_modules)
 
     # ── Student supernet ───────────────────────────────────────────────────
-    supernet = YOLOSupernet(
-        num_classes=len(VISDRONE_NAMES),
-        teacher_channels=t_channels,
-    )
+    supernet = YOLOSupernet(num_classes=len(VISDRONE_NAMES), teacher_channels=t_channels)
 
     last_ckpt = ckpt_dir / "supernet_last.pt"
     start_epoch = 0
     ckpt: dict[str, Any] = {}
     if resume and last_ckpt.exists():
-        print(f"[distill-famo] resuming from {last_ckpt}")
+        print(f"{prefix} resuming from {last_ckpt}")
         ckpt = torch.load(last_ckpt, map_location="cpu")
         supernet.load_state_dict(ckpt["supernet_state"])
         start_epoch = ckpt.get("epoch", 0) + 1
-        # Recover W&B run ID from checkpoint if not provided on CLI
         if wandb_run_id is None:
             wandb_run_id = ckpt.get("wandb_run_id")
     elif pretrained_backbone is not None:
@@ -270,26 +235,16 @@ def run_supernet_distill_famo(
         supernet = nn.DataParallel(supernet, device_ids=device_ids)
     supernet = supernet.to(primary)
 
-    inner: YOLOSupernet = (
-        supernet.module if isinstance(supernet, nn.DataParallel) else supernet
-    )
+    inner: YOLOSupernet = supernet.module if isinstance(supernet, nn.DataParallel) else supernet
 
     # ── Optimizer + scheduler ──────────────────────────────────────────────
-    optimizer = torch.optim.AdamW(
-        supernet.parameters(), lr=lr0, weight_decay=weight_decay
-    )
+    optimizer = torch.optim.AdamW(supernet.parameters(), lr=lr0, weight_decay=weight_decay)
     if resume and ckpt.get("optimizer_state"):
         optimizer.load_state_dict(ckpt["optimizer_state"])
 
-    warmup_sched = LinearLR(
-        optimizer, start_factor=1e-4, end_factor=1.0, total_iters=max(1, warmup_epochs)
-    )
-    cosine_sched = CosineAnnealingLR(
-        optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=lr0 * lrf
-    )
-    scheduler = SequentialLR(
-        optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs]
-    )
+    warmup_sched = LinearLR(optimizer, start_factor=1e-4, end_factor=1.0, total_iters=max(1, warmup_epochs))
+    cosine_sched = CosineAnnealingLR(optimizer, T_max=max(1, epochs - warmup_epochs), eta_min=lr0 * lrf)
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_epochs])
     for _ in range(start_epoch):
         scheduler.step()
 
@@ -303,16 +258,14 @@ def run_supernet_distill_famo(
 
     # ── W&B init ──────────────────────────────────────────────────────────
     git_sha = _git_sha(Path.cwd())
-    run_name = run_name or "supernet-distill-famo"
+    run_name = run_name or f"supernet-distill-{run_label}"
 
-    config = {
+    config: dict[str, Any] = {
         "model": "YOLOSupernet",
         "loss_weighting": "FAMO",
         "famo_gamma": famo_gamma,
         "teacher_weights": teacher_weights,
-        "teacher_channels": {
-            "P3": t_channels[0], "P4": t_channels[1], "P5": t_channels[2]
-        },
+        "teacher_channels": {"P3": t_channels[0], "P4": t_channels[1], "P5": t_channels[2]},
         "dataset": "VisDrone",
         "kaggle_dataset_slug": "banuprasadb/visdrone-dataset",
         "epochs": epochs,
@@ -324,36 +277,30 @@ def run_supernet_distill_famo(
         "lrf": lrf,
         "weight_decay": weight_decay,
         "warmup_epochs": warmup_epochs,
+        "pretrain_epochs": pretrain_epochs,
         "pretrained_backbone": pretrained_backbone,
         "backbone_depth_choices": BACKBONE_DEPTH_CHOICES,
         "neck_depth_choices": NECK_DEPTH_CHOICES,
-        "search_space_size": (
-            len(BACKBONE_DEPTH_CHOICES) ** 4 * len(NECK_DEPTH_CHOICES) ** 4
-        ),
+        "search_space_size": len(BACKBONE_DEPTH_CHOICES) ** 4 * len(NECK_DEPTH_CHOICES) ** 4,
         "accelerator": "NvidiaTeslaT4",
         "expected_gpu_count": len(device_ids),
         "git_sha": git_sha,
         "python": platform.python_version(),
+        **extra_config,
     }
 
-    # Resume an existing W&B run when run_id is known; otherwise start fresh.
+    base_tags = ["visdrone", "supernet", "spos", "kd", "distill", "famo", "kaggle"]
+    tags = base_tags[:-1] + extra_tags + base_tags[-1:]
+
     if resume and wandb_run_id:
         wandb_run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            id=wandb_run_id,
-            resume="must",
-            config=config,
+            project=wandb_project, entity=wandb_entity, id=wandb_run_id, resume="must", config=config,
         )
     else:
         wandb_run = wandb.init(
-            project=wandb_project,
-            entity=wandb_entity,
-            name=run_name,
-            job_type="supernet-distill-famo",
-            tags=["visdrone", "supernet", "spos", "kd", "distill", "famo", "kaggle"],
-            config=config,
-            resume="allow" if resume else None,
+            project=wandb_project, entity=wandb_entity, name=run_name,
+            job_type=f"supernet-distill-{run_label}",
+            tags=tags, config=config, resume="allow" if resume else None,
         )
     active_wandb_run_id: str = wandb_run.id
 
@@ -368,71 +315,79 @@ def run_supernet_distill_famo(
             supernet.train()
             teacher_nn.eval()
 
-            epoch_loss_total = 0.0
-            epoch_loss_task  = 0.0
-            epoch_loss_p3    = 0.0
-            epoch_loss_p4    = 0.0
-            epoch_loss_p5    = 0.0
+            epoch_loss_total = epoch_loss_task = epoch_loss_p3 = epoch_loss_p4 = epoch_loss_p5 = 0.0
             num_batches = 0
-            arch = inner.sample_arch()  # fallback for logging if loader is empty
+            arch = inner.sample_arch()
 
             for images, targets in train_loader:
-                # SPOS: new random sub-architecture every step
                 arch = inner.sample_arch()
                 inner.set_arch(arch)
 
                 images  = images.to(primary, non_blocking=True)
                 targets = targets.to(primary, non_blocking=True)
+                t_images = images.half() if teacher_half else images
                 optimizer.zero_grad()
 
-                # ① Teacher forward — populates _TEACHER_FEAT_STORE
-                with torch.no_grad():
-                    teacher_nn(images.half())
+                # ponytail: pretrain phase — task loss only, FAMO not updated
+                pretrain_phase = epoch < pretrain_epochs
+                if pretrain_phase:
+                    preds, _ = supernet(images)
+                    L_total = task_loss_fn(preds, targets, imgsz)
+                    l_task_item = L_total.item()
+                    l_p3_item = l_p4_item = l_p5_item = 0.0
+                else:
+                    # ① Teacher forward — populates _TEACHER_FEAT_STORE
+                    with torch.no_grad():
+                        teacher_nn(t_images)
 
-                # ② Student forward
-                preds, student_feats = supernet(images)
+                    # ② Student forward
+                    preds, student_feats = supernet(images)
 
-                # ③ Compute full-batch training losses (used for gradient)
-                losses = _compute_losses(preds, student_feats, targets, imgsz, task_loss_fn)
-                _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
+                    # ③ Full-batch losses for gradient
+                    losses = compute_losses_fn(preds, student_feats, targets, imgsz, task_loss_fn)
+                    _TEACHER_FEAT_STORE.clear()  # free ~171 MB teacher features before backward
 
-                # ③b 1-sample l_prev for FAMO — must be on same image as ⑤ so that
-                # delta = l_new - l_prev measures gradient improvement, not batch noise.
-                imgs1 = images[:1]
-                tgts1 = targets[targets[:, 0] == 0]
-                with torch.no_grad():
-                    teacher_nn(imgs1.half())
-                    p1, f1 = supernet(imgs1)
-                    famo.cache_prev(_compute_losses(p1, f1, tgts1, imgsz, task_loss_fn))
-                    _TEACHER_FEAT_STORE.clear()
+                    # ③b 1-sample l_prev for FAMO — must be on same image as ⑤ so that
+                    # delta = l_new - l_prev measures gradient improvement, not batch noise.
+                    imgs1   = images[:1]
+                    t_imgs1 = imgs1.half() if teacher_half else imgs1
+                    tgts1   = targets[targets[:, 0] == 0]
+                    with torch.no_grad():
+                        teacher_nn(t_imgs1)
+                        p1, f1 = supernet(imgs1)
+                        famo.cache_prev(compute_losses_fn(p1, f1, tgts1, imgsz, task_loss_fn))
+                        _TEACHER_FEAT_STORE.clear()
 
-                L_total = famo.weighted_loss(losses)
+                    L_total = famo.weighted_loss(losses)
+                    l_task_item = losses[0].item()
+                    l_p3_item   = losses[1].item()
+                    l_p4_item   = losses[2].item()
+                    l_p5_item   = losses[3].item()
 
                 # ④ Backward + gradient step
                 L_total.backward()
                 nn.utils.clip_grad_norm_(supernet.parameters(), max_norm=10.0)
                 optimizer.step()
 
-                # ⑤ FAMO update — same 1-sample image after gradient step
-                with torch.no_grad():
-                    teacher_nn(imgs1.half())
-                    preds2, feats2 = supernet(imgs1)
-                    losses2 = _compute_losses(
-                        preds2, feats2, tgts1, imgsz, task_loss_fn
-                    )
-                    _TEACHER_FEAT_STORE.clear()
-                famo.step(losses2)
+                if not pretrain_phase:
+                    # ⑤ FAMO update — same 1-sample image after gradient step
+                    with torch.no_grad():
+                        teacher_nn(t_imgs1)
+                        preds2, feats2 = supernet(imgs1)
+                        losses2 = compute_losses_fn(preds2, feats2, tgts1, imgsz, task_loss_fn)
+                        _TEACHER_FEAT_STORE.clear()
+                    famo.step(losses2)
 
                 epoch_loss_total += L_total.item()
-                epoch_loss_task  += losses[0].item()
-                epoch_loss_p3    += losses[1].item()
-                epoch_loss_p4    += losses[2].item()
-                epoch_loss_p5    += losses[3].item()
+                epoch_loss_task  += l_task_item
+                epoch_loss_p3    += l_p3_item
+                epoch_loss_p4    += l_p4_item
+                epoch_loss_p5    += l_p5_item
                 num_batches += 1
 
             scheduler.step()
             if use_cuda:
-                torch.cuda.empty_cache()  # defragment CUDA allocator pool each epoch
+                torch.cuda.empty_cache()
 
             nb = max(1, num_batches)
             avg_total = epoch_loss_total / nb
@@ -442,29 +397,27 @@ def run_supernet_distill_famo(
             avg_p5    = epoch_loss_p5    / nb
             current_lr = optimizer.param_groups[0]["lr"]
 
-            # ── Per-epoch val evaluation ───────────────────────────────────
-            val_metrics = _eval_student(
-                supernet, inner, val_loader, imgsz, primary,
-                num_classes=len(VISDRONE_NAMES),
-            )
+            val_metrics = _eval_student(supernet, inner, val_loader, imgsz, primary, num_classes=len(VISDRONE_NAMES))
             supernet.train()
 
-            log = {
-                "epoch":                  epoch + 1,
-                "train/loss_total":       avg_total,
-                "train/loss_task":        avg_task,
-                "train/loss_p3":          avg_p3,
-                "train/loss_p4":          avg_p4,
-                "train/loss_p5":          avg_p5,
-                "train/lr":               current_lr,
-                "famo/w_task":            famo.w[0].item(),
-                "famo/w_p3":              famo.w[1].item(),
-                "famo/w_p4":              famo.w[2].item(),
-                "famo/w_p5":              famo.w[3].item(),
-                "arch/backbone_depths":   str(arch.backbone_depths),
-                "arch/neck_depths":       str(arch.neck_depths),
+            log: dict[str, Any] = {
+                "epoch":                epoch + 1,
+                "train/loss_total":     avg_total,
+                "train/loss_task":      avg_task,
+                "train/loss_p3":        avg_p3,
+                "train/loss_p4":        avg_p4,
+                "train/loss_p5":        avg_p5,
+                "train/lr":             current_lr,
+                "famo/w_task":          famo.w[0].item(),
+                "famo/w_p3":            famo.w[1].item(),
+                "famo/w_p4":            famo.w[2].item(),
+                "famo/w_p5":            famo.w[3].item(),
+                "arch/backbone_depths": str(arch.backbone_depths),
+                "arch/neck_depths":     str(arch.neck_depths),
                 **val_metrics,
             }
+            if epoch == start_epoch:
+                log.update(extra_epoch0_log)
             wandb.log(log, step=epoch + 1)
             print(
                 f"[epoch {epoch + 1:3d}/{epochs}] "
@@ -486,7 +439,6 @@ def run_supernet_distill_famo(
             }
             torch.save(state, last_ckpt)
 
-            # Best checkpoint: prefer higher mAP50; fall back to lower loss
             if val_metrics["val/map50"] > best_map50:
                 best_map50 = val_metrics["val/map50"]
                 state["best_map50"] = best_map50
@@ -496,39 +448,32 @@ def run_supernet_distill_famo(
             if avg_total < best_loss:
                 best_loss = avg_total
 
-            # Periodic resume artifact upload
             if checkpoint_interval > 0 and (epoch + 1) % checkpoint_interval == 0:
                 resume_art = wandb.Artifact(
-                    name=f"{run_name}-resume",
-                    type="checkpoint",
+                    name=f"{run_name}-resume", type="checkpoint",
                     description=f"Resume checkpoint after epoch {epoch + 1}",
                 )
                 resume_art.add_file(str(last_ckpt), name="supernet_last.pt")
                 wandb_run.log_artifact(resume_art)
 
         summary_metrics = {
-            "train/best_loss_total":    best_loss,
-            "val/best_map50":           best_map50,
+            "train/best_loss_total":     best_loss,
+            "val/best_map50":            best_map50,
             "dataset/train_image_count": train_prepared.image_count,
             "dataset/val_image_count":   val_prepared.image_count,
             "dataset/train_label_count": train_prepared.label_count,
-            "run/git_sha":              git_sha,
-            "famo/final_w_task":        famo.w[0].item(),
-            "famo/final_w_p3":          famo.w[1].item(),
-            "famo/final_w_p4":          famo.w[2].item(),
-            "famo/final_w_p5":          famo.w[3].item(),
+            "run/git_sha":               git_sha,
+            "famo/final_w_task":         famo.w[0].item(),
+            "famo/final_w_p3":           famo.w[1].item(),
+            "famo/final_w_p4":           famo.w[2].item(),
+            "famo/final_w_p5":           famo.w[3].item(),
         }
         wandb.log(summary_metrics)
         wandb_run.summary.update(summary_metrics)
 
         if best_ckpt.exists():
             artifact = wandb.Artifact(
-                name="yolov26x-supernet-student-famo",
-                type="model",
-                description=(
-                    "SPOS supernet student trained with FAMO-weighted feature KD "
-                    "(task + P3/P4/P5 MSE) from YOLOv26x teacher on VisDrone"
-                ),
+                name=artifact_name, type="model", description=artifact_desc,
                 metadata={**config, **summary_metrics},
             )
             artifact.add_file(str(best_ckpt), name="supernet_best.pt")
@@ -539,9 +484,61 @@ def run_supernet_distill_famo(
     finally:
         wandb.finish()
 
-    metrics_path = work_dir / "supernet_distill_famo_metrics.json"
-    metrics_path.write_text(
-        json.dumps(summary_metrics, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    metrics_path = work_dir / metrics_filename
+    metrics_path.write_text(json.dumps(summary_metrics, indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(summary_metrics, indent=2, sort_keys=True))
     return summary_metrics
+
+
+def run_supernet_distill_famo(
+    data_root: Path,
+    work_dir: Path,
+    teacher_weights: str = "yolov26x-visdrone-teacher:best.pt",
+    epochs: int = 50,
+    imgsz: int = 640,
+    batch: int = 8,
+    workers: int = 4,
+    device: str = "0,1",
+    lr0: float = 0.001,
+    lrf: float = 0.01,
+    weight_decay: float = 0.0005,
+    warmup_epochs: int = 3,
+    pretrain_epochs: int = 0,
+    famo_gamma: float = 0.01,
+    pretrained_backbone: str | None = None,
+    cache: bool = False,
+    resume: bool = False,
+    checkpoint_interval: int = 5,
+    wandb_project: str = "distillNas",
+    wandb_entity: str | None = None,
+    wandb_run_id: str | None = None,
+    run_name: str | None = None,
+) -> dict[str, Any]:
+    """Train the YOLO supernet student with FAMO-weighted feature distillation.
+
+    Implements SPOS with FAMO (NeurIPS 2023) to balance four loss components:
+    L_task (detection BCE+GIoU), L_p3/L_p4/L_p5 (MSE feature distillation).
+    Teacher is cast to fp16 to fit on T4 at imgsz=640.
+    """
+    return _run_famo_training_loop(
+        data_root=data_root, work_dir=work_dir, teacher_weights=teacher_weights,
+        epochs=epochs, imgsz=imgsz, batch=batch, workers=workers, device=device,
+        lr0=lr0, lrf=lrf, weight_decay=weight_decay, warmup_epochs=warmup_epochs,
+        pretrain_epochs=pretrain_epochs,
+        famo_gamma=famo_gamma, pretrained_backbone=pretrained_backbone, cache=cache,
+        resume=resume, checkpoint_interval=checkpoint_interval,
+        wandb_project=wandb_project, wandb_entity=wandb_entity,
+        wandb_run_id=wandb_run_id, run_name=run_name,
+        compute_losses_fn=_compute_losses,
+        teacher_half=True,
+        run_label="famo",
+        artifact_name="yolov26x-supernet-student-famo",
+        artifact_desc=(
+            "SPOS supernet student trained with FAMO-weighted feature KD "
+            "(task + P3/P4/P5 MSE) from YOLOv26x teacher on VisDrone"
+        ),
+        extra_config={},
+        extra_epoch0_log={},
+        extra_tags=[],
+        metrics_filename="supernet_distill_famo_metrics.json",
+    )

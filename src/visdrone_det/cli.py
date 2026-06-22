@@ -14,11 +14,63 @@ from .infer import run_yolov26x_inference
 from .search import run_student_search
 
 
+def _wandb_parent() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--wandb-project", default="distillNas")
+    p.add_argument("--wandb-entity", default=None)
+    p.add_argument("--run-name", default=None)
+    return p
+
+
+def _distill_supernet_parent() -> argparse.ArgumentParser:
+    """Shared args for all three distill-supernet* subcommands."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument(
+        "--data-root", type=Path,
+        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
+    )
+    p.add_argument(
+        "--teacher-weights", default="yolov26x-visdrone-teacher:best.pt",
+        help="Local .pt path or Ultralytics model name for teacher weights",
+    )
+    p.add_argument("--epochs",        type=int,   default=50)
+    p.add_argument("--imgsz",         type=int,   default=640)
+    p.add_argument("--batch",         type=int,   default=8)
+    p.add_argument("--workers",       type=int,   default=4)
+    p.add_argument("--device",                    default="0,1")
+    p.add_argument("--lr0",           type=float, default=0.001)
+    p.add_argument("--lrf",           type=float, default=0.01)
+    p.add_argument("--weight-decay",  type=float, default=0.0005)
+    p.add_argument("--warmup-epochs",   type=int, default=3)
+    p.add_argument("--pretrain-epochs", type=int, default=0,
+                   help="Epochs of task-loss-only pre-training before KD begins (0 = off)")
+    p.add_argument(
+        "--pretrained-backbone", default=None, metavar="WEIGHTS",
+        help="Pretrained YOLO weights to initialize supernet backbone/neck (e.g. 'yolo26s.pt')",
+    )
+    p.add_argument("--cache",  action="store_true", default=False)
+    p.add_argument("--resume", action="store_true", default=False,
+                   help="Resume from supernet_last.pt in --work-dir")
+    p.add_argument(
+        "--checkpoint-interval", type=int, default=5,
+        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
+    )
+    p.add_argument(
+        "--wandb-run-id", default=None,
+        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
+    )
+    return p
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="visdrone-det")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    benchmark = subparsers.add_parser("benchmark-yolov26x", help="Evaluate YOLOv26x on VisDrone and log metrics to W&B")
+    benchmark = subparsers.add_parser(
+        "benchmark-yolov26x",
+        help="Evaluate YOLOv26x on VisDrone and log metrics to W&B",
+        parents=[_wandb_parent()],
+    )
     benchmark.add_argument("--data-root", type=Path, default=Path("/kaggle/input/visdrone-dataset"))
     benchmark.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-yolov26x-benchmark"))
     benchmark.add_argument("--split", default="val")
@@ -26,11 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--imgsz", type=int, default=640)
     benchmark.add_argument("--batch", type=int, default=16)
     benchmark.add_argument("--device", default="0,1")
-    benchmark.add_argument("--wandb-project", default="distillNas")
-    benchmark.add_argument("--wandb-entity", default=None)
-    benchmark.add_argument("--run-name", default=None)
 
-    infer = subparsers.add_parser("infer-yolov26x", help="Run YOLOv26x inference on VisDrone val, save annotated video to W&B")
+    infer = subparsers.add_parser(
+        "infer-yolov26x",
+        help="Run YOLOv26x inference on VisDrone val, save annotated video to W&B",
+        parents=[_wandb_parent()],
+    )
     infer.add_argument("--data-root", type=Path, default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"))
     infer.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-yolov26x-infer"))
     infer.add_argument("--split", default="val")
@@ -40,11 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     infer.add_argument("--device", default="0,1")
     infer.add_argument("--max-frames", type=int, default=300)
     infer.add_argument("--fps", type=float, default=5.0)
-    infer.add_argument("--wandb-project", default="distillNas")
-    infer.add_argument("--wandb-entity", default=None)
-    infer.add_argument("--run-name", default=None)
 
-    finetune = subparsers.add_parser("finetune-yolov26x", help="Fine-tune YOLOv26x on VisDrone train split (teacher stage)")
+    finetune = subparsers.add_parser(
+        "finetune-yolov26x",
+        help="Fine-tune YOLOv26x on VisDrone train split (teacher stage)",
+        parents=[_wandb_parent()],
+    )
     finetune.add_argument("--data-root", type=Path, default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"))
     finetune.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-yolov26x-finetune"))
     finetune.add_argument("--model", default="yolo26x.pt")
@@ -62,234 +116,65 @@ def build_parser() -> argparse.ArgumentParser:
     finetune.add_argument("--cache", action="store_true", default=False)
     finetune.add_argument("--resume", action="store_true", default=False)
     finetune.add_argument("--save-period", type=int, default=-1,
-                         help="Save epoch{N}.pt every N epochs (-1 disables, saves only last.pt/best.pt)")
+                          help="Save epoch{N}.pt every N epochs (-1 disables, saves only last.pt/best.pt)")
     finetune.add_argument("--checkpoint-interval", type=int, default=0,
-                         help="Log last.pt as W&B artifact every N epochs (0 disables; avoids disk fill from artifact cache)")
+                          help="Log last.pt as W&B artifact every N epochs (0 disables)")
     finetune.add_argument("--live-batch-log", action="store_true", default=False,
-                         help="Log per-batch training losses to W&B (noisy, for debugging)")
-    finetune.add_argument("--wandb-project", default="distillNas")
-    finetune.add_argument("--wandb-entity", default=None)
+                          help="Log per-batch training losses to W&B (noisy, for debugging)")
     finetune.add_argument("--wandb-run-id", default=None,
-                         help="W&B run ID to resume (uses resume='allow' to continue existing run)")
-    finetune.add_argument("--run-name", default=None)
+                          help="W&B run ID to resume (uses resume='allow' to continue existing run)")
 
     distill = subparsers.add_parser(
         "distill-supernet",
         help="Train YOLO supernet student with feature KD from YOLOv26x teacher",
+        parents=[_distill_supernet_parent(), _wandb_parent()],
     )
-    distill.add_argument(
-        "--data-root",
-        type=Path,
-        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
-    )
-    distill.add_argument(
-        "--work-dir",
-        type=Path,
-        default=Path("/kaggle/working/distillnas-supernet-distill"),
-    )
-    distill.add_argument(
-        "--teacher-weights",
-        default="yolov26x-visdrone-teacher:best.pt",
-        help="Local .pt path or Ultralytics model name for teacher weights",
-    )
-    distill.add_argument("--epochs", type=int, default=50)
-    distill.add_argument("--imgsz", type=int, default=640)
-    distill.add_argument("--batch", type=int, default=8)
-    distill.add_argument("--workers", type=int, default=4)
-    distill.add_argument("--device", default="0,1")
-    distill.add_argument("--lr0", type=float, default=0.001)
-    distill.add_argument("--lrf", type=float, default=0.01)
-    distill.add_argument("--weight-decay", type=float, default=0.0005)
-    distill.add_argument("--warmup-epochs", type=int, default=3)
-    distill.add_argument(
-        "--distill-weight",
-        type=float,
-        default=1.0,
-        help="Lambda weight for MSE feature distillation loss",
-    )
-    distill.add_argument(
-        "--task-weight",
-        type=float,
-        default=1.0,
-        help="Lambda weight for detection task loss",
-    )
-    distill.add_argument(
-        "--pretrained-backbone",
-        default=None,
-        metavar="WEIGHTS",
-        help=(
-            "Pretrained YOLO weights to initialize the supernet backbone/neck "
-            "(e.g. 'yolo26s.pt'). Skipped when --resume is used. "
-            "Layers whose shapes differ from the pretrained model are kept random."
-        ),
-    )
-    distill.add_argument("--cache", action="store_true", default=False)
-    distill.add_argument(
-        "--resume",
-        action="store_true",
-        default=False,
-        help="Resume from supernet_last.pt in --work-dir",
-    )
-    distill.add_argument(
-        "--checkpoint-interval",
-        type=int,
-        default=5,
-        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
-    )
-    distill.add_argument(
-        "--wandb-run-id",
-        default=None,
-        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
-    )
-    distill.add_argument("--wandb-project", default="distillNas")
-    distill.add_argument("--wandb-entity", default=None)
-    distill.add_argument("--run-name", default=None)
+    distill.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-supernet-distill"))
+    distill.add_argument("--distill-weight", type=float, default=1.0,
+                         help="Lambda weight for MSE feature distillation loss")
+    distill.add_argument("--task-weight", type=float, default=1.0,
+                         help="Lambda weight for detection task loss")
 
     distill_famo = subparsers.add_parser(
         "distill-supernet-famo",
         help="Train YOLO supernet with FAMO automatic loss weighting (NeurIPS 2023)",
+        parents=[_distill_supernet_parent(), _wandb_parent()],
     )
-    distill_famo.add_argument(
-        "--data-root", type=Path,
-        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
-    )
-    distill_famo.add_argument(
-        "--work-dir", type=Path,
-        default=Path("/kaggle/working/distillnas-supernet-distill-famo"),
-    )
-    distill_famo.add_argument(
-        "--teacher-weights", default="yolov26x-visdrone-teacher:best.pt",
-        help="Local .pt path or Ultralytics model name for teacher weights",
-    )
-    distill_famo.add_argument("--epochs",        type=int,   default=50)
-    distill_famo.add_argument("--imgsz",         type=int,   default=640)
-    distill_famo.add_argument("--batch",         type=int,   default=8)
-    distill_famo.add_argument("--workers",       type=int,   default=4)
-    distill_famo.add_argument("--device",                    default="0,1")
-    distill_famo.add_argument("--lr0",           type=float, default=0.001)
-    distill_famo.add_argument("--lrf",           type=float, default=0.01)
-    distill_famo.add_argument("--weight-decay",  type=float, default=0.0005)
-    distill_famo.add_argument("--warmup-epochs", type=int,   default=3)
-    distill_famo.add_argument(
-        "--famo-gamma", type=float, default=0.01,
-        help="FAMO weight-update step size (how fast weights adapt to loss changes)",
-    )
-    distill_famo.add_argument(
-        "--pretrained-backbone", default=None, metavar="WEIGHTS",
-        help="Pretrained YOLO weights to initialize supernet backbone/neck (e.g. 'yolo26s.pt')",
-    )
-    distill_famo.add_argument("--cache",  action="store_true", default=False)
-    distill_famo.add_argument("--resume", action="store_true", default=False,
-                              help="Resume from supernet_last.pt in --work-dir")
-    distill_famo.add_argument(
-        "--checkpoint-interval", type=int, default=5,
-        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
-    )
-    distill_famo.add_argument(
-        "--wandb-run-id", default=None,
-        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
-    )
-    distill_famo.add_argument("--wandb-project", default="distillNas")
-    distill_famo.add_argument("--wandb-entity",  default=None)
-    distill_famo.add_argument("--run-name",      default=None)
+    distill_famo.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-supernet-distill-famo"))
+    distill_famo.add_argument("--famo-gamma", type=float, default=0.01,
+                              help="FAMO weight-update step size (how fast weights adapt to loss changes)")
 
     distill_famo_mask = subparsers.add_parser(
         "distill-supernet-famo-mask",
         help="SPOS supernet distillation with FAMO + foreground-masked MSE (NeurIPS 2023 + GT heatmap)",
+        parents=[_distill_supernet_parent(), _wandb_parent()],
     )
-    distill_famo_mask.add_argument(
-        "--data-root", type=Path,
-        default=Path("/kaggle/input/datasets/banuprasadb/visdrone-dataset"),
-    )
-    distill_famo_mask.add_argument(
-        "--work-dir", type=Path,
-        default=Path("/kaggle/working/distillnas-supernet-distill-famo-mask"),
-    )
-    distill_famo_mask.add_argument(
-        "--teacher-weights", default="yolov26x-visdrone-teacher:best.pt",
-        help="Local .pt path or Ultralytics model name for teacher weights",
-    )
-    distill_famo_mask.add_argument("--epochs",        type=int,   default=50)
-    distill_famo_mask.add_argument("--imgsz",         type=int,   default=640)
-    distill_famo_mask.add_argument("--batch",         type=int,   default=8)
-    distill_famo_mask.add_argument("--workers",       type=int,   default=4)
-    distill_famo_mask.add_argument("--device",                    default="0,1")
-    distill_famo_mask.add_argument("--lr0",           type=float, default=0.001)
-    distill_famo_mask.add_argument("--lrf",           type=float, default=0.01)
-    distill_famo_mask.add_argument("--weight-decay",  type=float, default=0.0005)
-    distill_famo_mask.add_argument("--warmup-epochs", type=int,   default=3)
-    distill_famo_mask.add_argument(
-        "--famo-gamma", type=float, default=0.01,
-        help="FAMO weight-update step size (how fast weights adapt to loss changes)",
-    )
-    distill_famo_mask.add_argument(
-        "--mask-sigma", type=float, default=2.0,
-        help="Gaussian sigma in grid cells for the foreground heatmap mask",
-    )
-    distill_famo_mask.add_argument(
-        "--pretrained-backbone", default=None, metavar="WEIGHTS",
-        help="Pretrained YOLO weights to initialize supernet backbone/neck (e.g. 'yolo26s.pt')",
-    )
-    distill_famo_mask.add_argument("--cache",  action="store_true", default=False)
-    distill_famo_mask.add_argument("--resume", action="store_true", default=False,
-                                   help="Resume from supernet_last.pt in --work-dir")
-    distill_famo_mask.add_argument(
-        "--checkpoint-interval", type=int, default=5,
-        help="Upload supernet_last.pt as W&B checkpoint artifact every N epochs (0 disables)",
-    )
-    distill_famo_mask.add_argument(
-        "--wandb-run-id", default=None,
-        help="W&B run ID to resume (loaded from checkpoint if --resume used without this flag)",
-    )
-    distill_famo_mask.add_argument("--wandb-project", default="distillNas")
-    distill_famo_mask.add_argument("--wandb-entity",  default=None)
-    distill_famo_mask.add_argument("--run-name",      default=None)
+    distill_famo_mask.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-supernet-distill-famo-mask"))
+    distill_famo_mask.add_argument("--famo-gamma", type=float, default=0.01,
+                                   help="FAMO weight-update step size")
+    distill_famo_mask.add_argument("--mask-sigma", type=float, default=2.0,
+                                   help="Gaussian sigma in grid cells for the foreground heatmap mask")
 
     search = subparsers.add_parser(
         "search-student",
         help="Search the trained supernet for the best sub-architecture (Stage 3 NAS)",
+        parents=[_wandb_parent()],
     )
-    search.add_argument(
-        "--supernet-weights",
-        default="yolov26x-supernet-student:supernet_best.pt",
-        help="Path to supernet_best.pt from distill-supernet, or W&B artifact ref",
-    )
-    search.add_argument(
-        "--work-dir",
-        type=Path,
-        default=Path("/kaggle/working/distillnas-student-search"),
-    )
-    search.add_argument(
-        "--n-samples",
-        type=int,
-        default=50,
-        help="Number of random sub-architectures to evaluate (random search only)",
-    )
-    search.add_argument(
-        "--search-mode",
-        choices=["random", "exhaustive"],
-        default="random",
-        help="'random': sample n-samples; 'exhaustive': evaluate all 1,296 sub-networks",
-    )
+    search.add_argument("--supernet-weights", default="yolov26x-supernet-student:supernet_best.pt",
+                        help="Path to supernet_best.pt from distill-supernet, or W&B artifact ref")
+    search.add_argument("--work-dir", type=Path, default=Path("/kaggle/working/distillnas-student-search"))
+    search.add_argument("--n-samples", type=int, default=50,
+                        help="Number of random sub-architectures to evaluate (random search only)")
+    search.add_argument("--search-mode", choices=["random", "exhaustive"], default="random",
+                        help="'random': sample n-samples; 'exhaustive': evaluate all 1,296 sub-networks")
     search.add_argument("--imgsz", type=int, default=320)
     search.add_argument("--batch", type=int, default=4)
-    search.add_argument(
-        "--n-proxy-batches",
-        type=int,
-        default=4,
-        help="Number of random batches to average proxy score over per architecture",
-    )
+    search.add_argument("--n-proxy-batches", type=int, default=4,
+                        help="Number of random batches to average proxy score over per architecture")
     search.add_argument("--device", default="0")
     search.add_argument("--seed", type=int, default=42)
-    search.add_argument(
-        "--dummy-weights",
-        action="store_true",
-        default=False,
-        help="Skip loading supernet weights and use random init (for testing)",
-    )
-    search.add_argument("--wandb-project", default="distillNas")
-    search.add_argument("--wandb-entity", default=None)
-    search.add_argument("--run-name", default=None)
+    search.add_argument("--dummy-weights", action="store_true", default=False,
+                        help="Skip loading supernet weights and use random init (for testing)")
 
     return parser
 
@@ -368,6 +253,7 @@ def main(argv: list[str] | None = None) -> int:
             lrf=args.lrf,
             weight_decay=args.weight_decay,
             warmup_epochs=args.warmup_epochs,
+            pretrain_epochs=args.pretrain_epochs,
             distill_weight=args.distill_weight,
             task_weight=args.task_weight,
             pretrained_backbone=args.pretrained_backbone,
@@ -394,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
             lrf=args.lrf,
             weight_decay=args.weight_decay,
             warmup_epochs=args.warmup_epochs,
+            pretrain_epochs=args.pretrain_epochs,
             famo_gamma=args.famo_gamma,
             pretrained_backbone=args.pretrained_backbone,
             cache=args.cache,
@@ -419,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
             lrf=args.lrf,
             weight_decay=args.weight_decay,
             warmup_epochs=args.warmup_epochs,
+            pretrain_epochs=args.pretrain_epochs,
             famo_gamma=args.famo_gamma,
             mask_sigma=args.mask_sigma,
             pretrained_backbone=args.pretrained_backbone,

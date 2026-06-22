@@ -664,6 +664,7 @@ def run_supernet_distill(
     lrf: float = 0.01,
     weight_decay: float = 0.0005,
     warmup_epochs: int = 3,
+    pretrain_epochs: int = 0,
     distill_weight: float = 1.0,
     task_weight: float = 1.0,
     pretrained_backbone: str | None = None,
@@ -850,6 +851,7 @@ def run_supernet_distill(
         "lrf": lrf,
         "weight_decay": weight_decay,
         "warmup_epochs": warmup_epochs,
+        "pretrain_epochs": pretrain_epochs,
         "distill_weight": distill_weight,
         "task_weight": task_weight,
         "pretrained_backbone": pretrained_backbone,
@@ -910,18 +912,22 @@ def run_supernet_distill(
                 targets = targets.to(primary, non_blocking=True)
                 optimizer.zero_grad()
 
-                # Teacher forward (no grad) — side-effect: fills _TEACHER_FEAT_STORE
-                with torch.no_grad():
-                    teacher_nn(images)
+                # ponytail: pretrain phase — skip teacher to let supernet stabilize first
+                if epoch >= pretrain_epochs:
+                    with torch.no_grad():
+                        teacher_nn(images)
 
-                # Student forward
                 preds, student_feats = supernet(images)
 
-                # Losses
                 L_task = task_loss_fn(preds, targets, imgsz)
-                L_distill = _distill_loss(student_feats)
-                _TEACHER_FEAT_STORE.clear()  # free ~171 MB of teacher features before backward
-                L_total = task_weight * L_task + distill_weight * L_distill
+                if epoch < pretrain_epochs:
+                    L_total = task_weight * L_task
+                    l_distill_item = 0.0
+                else:
+                    L_distill = _distill_loss(student_feats)
+                    _TEACHER_FEAT_STORE.clear()  # free ~171 MB of teacher features before backward
+                    L_total = task_weight * L_task + distill_weight * L_distill
+                    l_distill_item = L_distill.item()
 
                 L_total.backward()
                 nn.utils.clip_grad_norm_(supernet.parameters(), max_norm=10.0)
@@ -929,7 +935,7 @@ def run_supernet_distill(
 
                 epoch_loss_total += L_total.item()
                 epoch_loss_task += L_task.item()
-                epoch_loss_distill += L_distill.item()
+                epoch_loss_distill += l_distill_item
                 num_batches += 1
 
             scheduler.step()
