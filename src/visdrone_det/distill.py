@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 import torch
 import torch.nn as nn
@@ -33,33 +34,46 @@ from .visdrone import VISDRONE_NAMES, prepare_yolo_dataset
 
 
 class _VisDroneDataset(Dataset):
-    """Minimal YOLO-format image + label loader for VisDrone splits.
+    """YOLO-format image + label loader for VisDrone splits with standard
+    YOLO data augmentation (mosaic, HSV jitter, random flip, scale jitter).
 
-    Reads from the symlinked ``images/`` and ``labels/`` directories produced
-    by ``prepare_yolo_dataset()``.  Applies letterbox resize to a fixed square.
     Returns ``(img_tensor [3, H, W], labels [N, 5])`` where labels are
     ``[class_id, cx, cy, w, h]`` in [0, 1] range.
     """
 
-    def __init__(self, images_dir: Path, labels_dir: Path, imgsz: int) -> None:
+    def __init__(
+        self,
+        images_dir: Path,
+        labels_dir: Path,
+        imgsz: int,
+        augment: bool = True,
+        mosaic_prob: float = 0.75,
+    ) -> None:
         self.imgsz = imgsz
+        self.augment = augment
+        self.mosaic_prob = mosaic_prob
         self.labels_dir = labels_dir
         exts = ("*.jpg", "*.jpeg", "*.png", "*.bmp")
         self.images: list[Path] = sorted(
             p for ext in exts for p in images_dir.glob(ext)
         )
+        self._label_paths = [
+            self.labels_dir / (img_path.stem + ".txt")
+            for img_path in self.images
+        ]
 
     def __len__(self) -> int:
         return len(self.images)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def _load_image_and_labels(
+        self, idx: int
+    ) -> tuple[np.ndarray, np.ndarray, float, float]:
+        """Load and return (img_np [H,W,3] uint8, labels [N,5] pixel coords, w, h)."""
         img_path = self.images[idx]
-        label_path = self.labels_dir / (img_path.stem + ".txt")
-
+        label_path = self._label_paths[idx]
         img = Image.open(img_path).convert("RGB")
         orig_w, orig_h = img.size
-        img_t, scale, pad_left, pad_top = _letterbox(img, self.imgsz)
-
+        img_np = np.asarray(img, dtype=np.uint8)
         labels: list[list[float]] = []
         if label_path.exists():
             for line in label_path.read_text(encoding="utf-8").splitlines():
@@ -71,25 +85,154 @@ class _VisDroneDataset(Dataset):
                     continue
                 cls = int(parts[0])
                 cx_n, cy_n, w_n, h_n = (float(p) for p in parts[1:])
-                # Adjust normalized coords for letterbox transform
-                cx_px = cx_n * orig_w * scale + pad_left
-                cy_px = cy_n * orig_h * scale + pad_top
-                w_px = w_n * orig_w * scale
-                h_px = h_n * orig_h * scale
-                # Re-normalize to imgsz
-                cx_r = cx_px / self.imgsz
-                cy_r = cy_px / self.imgsz
-                w_r = w_px / self.imgsz
-                h_r = h_px / self.imgsz
-                if 0 < cx_r < 1 and 0 < cy_r < 1 and w_r > 0 and h_r > 0:
-                    labels.append([cls, cx_r, cy_r, w_r, h_r])
+                labels.append([cls, cx_n * orig_w, cy_n * orig_h, w_n * orig_w, h_n * orig_h])
+        labels_np = np.array(labels, dtype=np.float32) if labels else np.zeros((0, 5), dtype=np.float32)
+        return img_np, labels_np, orig_w, orig_h
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.augment and np.random.random() < self.mosaic_prob:
+            return self._mosaic_augment(idx)
+        return self._base_augment(idx)
+
+    def _base_augment(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Letterbox resize + HSV jitter + random flip. No mosaic."""
+        img_np, labels, orig_w, orig_h = self._load_image_and_labels(idx)
+
+        # HSV jitter
+        if self.augment:
+            img_np = _random_hsv_jitter(img_np, h_gain=0.015, s_gain=0.7, v_gain=0.4)
+
+            # Random horizontal flip
+            if np.random.random() < 0.5:
+                img_np = np.fliplr(img_np).copy()
+                if len(labels) > 0:
+                    labels[:, 1] = orig_w - labels[:, 1]
+
+            # Random scale jitter (±25%)
+            scale = np.random.uniform(0.75, 1.25)
+            new_size = int(self.imgsz * scale + 0.5)
+            new_size = max(32, new_size)
+        else:
+            scale = 1.0
+            new_size = self.imgsz
+
+        img_t, scale_factor, pad_left, pad_top = _letterbox_np(
+            img_np, new_size, self.imgsz
+        )
+
+        if len(labels) > 0:
+            cx_px = labels[:, 1]
+            cy_px = labels[:, 2]
+            w_px = labels[:, 3]
+            h_px = labels[:, 4]
+            cx_r = (cx_px * scale_factor + pad_left) / self.imgsz
+            cy_r = (cy_px * scale_factor + pad_top) / self.imgsz
+            w_r = (w_px * scale_factor) / self.imgsz
+            h_r = (h_px * scale_factor) / self.imgsz
+            valid = (
+                (cx_r > 0) & (cx_r < 1) &
+                (cy_r > 0) & (cy_r < 1) &
+                (w_r > 0) & (h_r > 0)
+            )
+            labels = labels[valid]
+            if len(labels) > 0:
+                labels[:, 1] = cx_r[valid]
+                labels[:, 2] = cy_r[valid]
+                labels[:, 3] = w_r[valid]
+                labels[:, 4] = h_r[valid]
 
         labels_t = (
-            torch.tensor(labels, dtype=torch.float32)
-            if labels
+            torch.from_numpy(labels).float()
+            if len(labels) > 0
             else torch.zeros((0, 5), dtype=torch.float32)
         )
         return img_t, labels_t
+
+    def _mosaic_augment(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Standard YOLO mosaic: combine 4 images in a 2×2 grid."""
+        indices = [idx] + [np.random.randint(0, len(self.images)) for _ in range(3)]
+        np.random.shuffle(indices)
+
+        mosaic_img = np.full((self.imgsz * 2, self.imgsz * 2, 3), 114, dtype=np.uint8)
+        all_labels: list[np.ndarray] = []
+
+        yc = int(np.random.uniform(self.imgsz // 2, self.imgsz * 3 // 2))
+        xc = int(np.random.uniform(self.imgsz // 2, self.imgsz * 3 // 2))
+
+        for i, sample_idx in enumerate(indices):
+            img_np, labels, orig_w, orig_h = self._load_image_and_labels(sample_idx)
+
+            if np.random.random() < 0.5:
+                img_np = _random_hsv_jitter(img_np, h_gain=0.015, s_gain=0.7, v_gain=0.4)
+
+            if np.random.random() < 0.5:
+                img_np = np.fliplr(img_np).copy()
+                if len(labels) > 0:
+                    labels[:, 1] = orig_w - labels[:, 1]
+
+            scale = min(self.imgsz / orig_w, self.imgsz / orig_h)
+            new_w = int(orig_w * scale + 0.5)
+            new_h = int(orig_h * scale + 0.5)
+            img_resized = cv2.resize(img_np, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+            if i == 0:
+                x1a, y1a = max(xc - new_w, 0), max(yc - new_h, 0)
+                x2a, y2a = xc, yc
+                x1b, y1b = new_w - (x2a - x1a), new_h - (y2a - y1a)
+                x2b, y2b = new_w, new_h
+            elif i == 1:
+                x1a, y1a = xc, max(yc - new_h, 0)
+                x2a, y2a = min(xc + new_w, self.imgsz * 2), yc
+                x1b, y1b = 0, new_h - (y2a - y1a)
+                x2b, y2b = min(new_w, x2a - x1a), new_h
+            elif i == 2:
+                x1a, y1a = max(xc - new_w, 0), yc
+                x2a, y2a = xc, min(yc + new_h, self.imgsz * 2)
+                x1b, y1b = new_w - (x2a - x1a), 0
+                x2b, y2b = new_w, min(new_h, y2a - y1a)
+            else:
+                x1a, y1a = xc, yc
+                x2a, y2a = min(xc + new_w, self.imgsz * 2), min(yc + new_h, self.imgsz * 2)
+                x1b, y1b = 0, 0
+                x2b, y2b = min(new_w, x2a - x1a), min(new_h, y2a - y1a)
+
+            mosaic_img[y1a:y2a, x1a:x2a] = img_resized[y1b:y2b, x1b:x2b]
+
+            if len(labels) > 0:
+                pad_w = x1a - x1b
+                pad_h = y1a - y1b
+                labels[:, 1] = labels[:, 1] * scale + pad_w
+                labels[:, 2] = labels[:, 2] * scale + pad_h
+                labels[:, 3] = labels[:, 3] * scale
+                labels[:, 4] = labels[:, 4] * scale
+                all_labels.append(labels)
+
+        img_cropped = mosaic_img[yc - self.imgsz // 2:yc + self.imgsz // 2,
+                                 xc - self.imgsz // 2:xc + self.imgsz // 2]
+
+        img_tensor = torch.from_numpy(
+            img_cropped.astype(np.float32).transpose(2, 0, 1) / 255.0
+        )
+
+        if all_labels:
+            combined = np.concatenate(all_labels, axis=0)
+            x_offset = xc - self.imgsz // 2
+            y_offset = yc - self.imgsz // 2
+            combined[:, 1] -= x_offset
+            combined[:, 2] -= y_offset
+            valid = (
+                (combined[:, 1] > 0) & (combined[:, 1] < self.imgsz) &
+                (combined[:, 2] > 0) & (combined[:, 2] < self.imgsz) &
+                (combined[:, 3] > 0) & (combined[:, 4] > 0)
+            )
+            combined = combined[valid]
+            if len(combined) > 0:
+                combined[:, 1:5] /= self.imgsz
+            labels_t = torch.from_numpy(combined).float()
+        else:
+            labels_t = torch.zeros((0, 5), dtype=torch.float32)
+
+        return img_tensor, labels_t
 
 
 def _letterbox(
@@ -111,6 +254,45 @@ def _letterbox(
     canvas.paste(img, (pad_left, pad_top))
     arr = np.asarray(canvas, dtype=np.float32) / 255.0
     tensor = torch.from_numpy(arr.transpose(2, 0, 1))  # HWC → CHW
+    return tensor, scale, pad_left, pad_top
+
+
+def _random_hsv_jitter(
+    img: np.ndarray,
+    h_gain: float = 0.015,
+    s_gain: float = 0.7,
+    v_gain: float = 0.4,
+) -> np.ndarray:
+    """Apply random HSV jitter (YOLOv5-style). img: [H, W, 3] uint8 RGB."""
+    r = np.random.uniform(-1.0, 1.0, 3) * [h_gain, s_gain, v_gain] + 1.0
+    h, s, v = cv2.split(cv2.cvtColor(img, cv2.COLOR_RGB2HSV))
+    x = np.arange(0, 256, dtype=np.float32)
+    lut_h = ((x * r[0]) % 180).astype(np.uint8)
+    lut_s = np.clip(x * r[1], 0, 255).astype(np.uint8)
+    lut_v = np.clip(x * r[2], 0, 255).astype(np.uint8)
+    h = cv2.LUT(h, lut_h)
+    s = cv2.LUT(s, lut_s)
+    v = cv2.LUT(v, lut_v)
+    return cv2.cvtColor(cv2.merge([h, s, v]), cv2.COLOR_HSV2RGB)
+
+
+def _letterbox_np(
+    img: np.ndarray,
+    target_size: int,
+    canvas_size: int,
+) -> tuple[torch.Tensor, float, int, int]:
+    """Resize img to target_size×target_size, pad to canvas_size×canvas_size.
+    Returns (tensor [3, canvas_size, canvas_size], scale, pad_left, pad_top)."""
+    h, w = img.shape[:2]
+    scale = target_size / max(w, h)
+    new_w = int(w * scale + 0.5)
+    new_h = int(h * scale + 0.5)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    canvas = np.full((canvas_size, canvas_size, 3), 114, dtype=np.uint8)
+    pad_left = (canvas_size - new_w) // 2
+    pad_top = (canvas_size - new_h) // 2
+    canvas[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
+    tensor = torch.from_numpy(canvas.astype(np.float32).transpose(2, 0, 1) / 255.0)
     return tensor, scale, pad_left, pad_top
 
 
@@ -137,6 +319,9 @@ def _collate_fn(
 
 # Module-level store: populated by teacher forward hooks, read by _distill_loss().
 _TEACHER_FEAT_STORE: dict[str, torch.Tensor] = {}
+
+# Module-level store: tracks which sub-architecture was sampled for eval each epoch.
+_EVAL_ARCH_STORE: dict[str, Any] = {"backbone_depths": None, "neck_depths": None}
 
 
 def _find_fpn_layers(
@@ -270,6 +455,40 @@ def _giou(
     return (1.0 - giou_val).mean()
 
 
+class _FocalLoss(nn.Module):
+    """Focal Loss for dense object detection (Lin et al., ICCV 2017).
+
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+
+    Down-weights well-classified negatives so the model focuses on the rare
+    positive grid cells — critical for VisDrone's ~99.96% negative ratio.
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: float = 0.25,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        prob = torch.sigmoid(inputs)
+        p_t = targets * prob + (1 - targets) * (1 - prob)
+        alpha_t = targets * self.alpha + (1 - targets) * (1 - self.alpha)
+        bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+        focal_weight = alpha_t * (1 - p_t) ** self.gamma
+        loss = focal_weight * bce
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
 class _TaskLoss:
     """Simplified anchor-free detection loss for supernet training regularization.
 
@@ -284,7 +503,7 @@ class _TaskLoss:
 
     def __init__(self, num_classes: int = 10) -> None:
         self.nc = num_classes
-        self.bce = nn.BCEWithLogitsLoss(reduction="mean")
+        self.bce = _FocalLoss(gamma=2.0, alpha=0.25, reduction="mean")
 
     def _assign_scale(self, w_n: float, h_n: float, imgsz: int) -> int:
         area = (w_n * imgsz) * (h_n * imgsz)
@@ -451,12 +670,13 @@ def _eval_student(
         print("[eval] torchvision not available; skipping val eval", flush=True)
         return {"val/map50": 0.0, "val/precision": 0.0, "val/recall": 0.0}
 
-    # Fix a deterministic max-depth arch for eval comparability
-    eval_arch = ArchConfig(
-        backbone_depths=(3, 3, 3, 3),
-        neck_depths=(2, 2, 2, 2),
-    )
+    # SPOS: sample a fresh random sub-architecture for validation each epoch.
+    # A random arch tests whether weight-sharing truly benefits all subnets.
+    # The per-epoch mAP50 may vary but the trend over epochs is meaningful.
+    eval_arch = inner.sample_arch()
     inner.set_arch(eval_arch)
+    _EVAL_ARCH_STORE["backbone_depths"] = eval_arch.backbone_depths
+    _EVAL_ARCH_STORE["neck_depths"] = eval_arch.neck_depths
     supernet.eval()
 
     # all_preds[i] = list of (boxes [N,4], scores [N], class_ids [N]) per image
@@ -724,6 +944,8 @@ def run_supernet_distill(
         images_dir=train_prepared.images,
         labels_dir=train_prepared.labels,
         imgsz=imgsz,
+        augment=True,
+        mosaic_prob=0.75,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -734,11 +956,15 @@ def run_supernet_distill(
         drop_last=True,
         collate_fn=_collate_fn,
     )
+
+    close_mosaic = 10  # disable mosaic in last N epochs
+
     val_loader = DataLoader(
         _VisDroneDataset(
             images_dir=val_prepared.images,
             labels_dir=val_prepared.labels,
             imgsz=imgsz,
+            augment=False,
         ),
         batch_size=batch,
         shuffle=False,
@@ -804,8 +1030,12 @@ def run_supernet_distill(
     inner: YOLOSupernet = (
         supernet.module if isinstance(supernet, nn.DataParallel) else supernet
     )
-    optimizer = torch.optim.AdamW(
-        supernet.parameters(), lr=lr0, weight_decay=weight_decay
+    optimizer = torch.optim.SGD(
+        supernet.parameters(),
+        lr=lr0,
+        momentum=0.937,
+        weight_decay=weight_decay,
+        nesterov=True,
     )
     if resume and ckpt.get("optimizer_state"):
         optimizer.load_state_dict(ckpt["optimizer_state"])
@@ -897,6 +1127,12 @@ def run_supernet_distill(
             supernet.train()
             teacher_nn.eval()
 
+            # Close mosaic: disable mosaic in the last N epochs so the model
+            # trains on real image distributions for final convergence.
+            if close_mosaic > 0 and epoch == epochs - close_mosaic:
+                train_dataset.mosaic_prob = 0.0
+                print(f"[distill] disabled mosaic at epoch {epoch + 1}", flush=True)
+
             epoch_loss_total = 0.0
             epoch_loss_task = 0.0
             epoch_loss_distill = 0.0
@@ -961,6 +1197,8 @@ def run_supernet_distill(
                 "train/lr": current_lr,
                 "arch/backbone_depths": str(arch.backbone_depths),
                 "arch/neck_depths": str(arch.neck_depths),
+                "eval/backbone_depths": str(_EVAL_ARCH_STORE.get("backbone_depths")),
+                "eval/neck_depths": str(_EVAL_ARCH_STORE.get("neck_depths")),
                 **val_metrics,
             }
             wandb.log(log, step=epoch + 1)
@@ -972,7 +1210,7 @@ def run_supernet_distill(
                 f"arch={arch.backbone_depths}+{arch.neck_depths}"
             )
 
-            # Save checkpoint (includes W&B run ID for resume continuity)
+            # Checkpoint: supernet state is already on CPU after .to('cpu') below
             state = {
                 "epoch": epoch,
                 "supernet_state": inner.state_dict(),
@@ -1004,8 +1242,8 @@ def run_supernet_distill(
                 resume_art.add_file(str(last_ckpt), name="supernet_last.pt")
                 wandb_run.log_artifact(resume_art)
 
-            if use_cuda:
-                torch.cuda.empty_cache()  # defragment CUDA allocator pool each epoch
+            # if use_cuda:
+            #     torch.cuda.empty_cache()  # omitted — triggers PyTorch 2.6 optimizer device-mismatch bug
 
         summary_metrics = {
             "train/best_loss_total": best_loss,
