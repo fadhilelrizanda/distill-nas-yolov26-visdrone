@@ -14,7 +14,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from PIL import Image
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader, Dataset
 
@@ -235,26 +234,7 @@ class _VisDroneDataset(Dataset):
         return img_tensor, labels_t
 
 
-def _letterbox(
-    img: Image.Image,
-    size: int,
-) -> tuple[torch.Tensor, float, int, int]:
-    """Resize and pad image to ``size × size`` (letterbox).
-
-    Returns ``(tensor [3, size, size], scale, pad_left, pad_top)``.
-    """
-    w, h = img.size
-    scale = min(size / w, size / h)
-    new_w = int(w * scale + 0.5)
-    new_h = int(h * scale + 0.5)
-    img = img.resize((new_w, new_h), Image.BILINEAR)
-    canvas = Image.new("RGB", (size, size), (114, 114, 114))
-    pad_left = (size - new_w) // 2
-    pad_top = (size - new_h) // 2
-    canvas.paste(img, (pad_left, pad_top))
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr.transpose(2, 0, 1))  # HWC → CHW
-    return tensor, scale, pad_left, pad_top
+# ── HSV jitter (NumPy) ──────────────────────────────────────────────────────
 
 
 def _random_hsv_jitter(
@@ -1129,9 +1109,10 @@ def run_supernet_distill(
 
             # Close mosaic: disable mosaic in the last N epochs so the model
             # trains on real image distributions for final convergence.
-            if close_mosaic > 0 and epoch == epochs - close_mosaic:
-                train_dataset.mosaic_prob = 0.0
-                print(f"[distill] disabled mosaic at epoch {epoch + 1}", flush=True)
+            if close_mosaic > 0 and epoch >= epochs - close_mosaic:
+                if train_dataset.mosaic_prob != 0.0:
+                    train_dataset.mosaic_prob = 0.0
+                    print(f"[distill] disabled mosaic at epoch {epoch + 1}", flush=True)
 
             epoch_loss_total = 0.0
             epoch_loss_task = 0.0
